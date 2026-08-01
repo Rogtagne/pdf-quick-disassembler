@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: pdf-quick-disassembler
+    runtime: python
+    pythonVersion: "3.12.0"
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn web_app:app --workers 2 --timeout 180 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PQD_MAX_MB
+        value: "50"

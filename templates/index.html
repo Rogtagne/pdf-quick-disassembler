@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PDF Quick Disassembler — GoTopo</title>
+  <link rel="stylesheet" href="/static/css/app.css"/>
+</head>
+<body>
+
+  <!-- ── HEADER ──────────────────────────────────────────────────────────── -->
+  <div class="top-band"></div>
+  <header>
+    <div class="header-inner">
+      <span class="logo-icon">⚡</span>
+      <div class="header-text">
+        <h1>PDF Quick Disassembler</h1>
+        <p class="subtitle">by GoTopo &nbsp;•&nbsp; v3.4 Web &nbsp;•&nbsp; 2026</p>
+        <p class="tagline">Desarma, edita y reconstruye documentos PDF</p>
+      </div>
+    </div>
+  </header>
+  <div class="gold-line"></div>
+
+  <!-- ── TABS ────────────────────────────────────────────────────────────── -->
+  <div class="tabs-bar">
+    <button class="tab-btn active" data-tab="fase1">📄 FASE 1 — a PDF</button>
+    <button class="tab-btn"        data-tab="fase2">🔓 FASE 2 — a PowerPoint</button>
+    <button class="tab-btn"        data-tab="table">📊 PDF Table Recovery</button>
+  </div>
+
+  <main>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         FASE 1
+    ═════════════════════════════════════════════════════════════════════ -->
+    <div id="tab-fase1" class="tab-panel active">
+      <div class="panel-header">
+        <span class="phase-label gold">FASE 1</span>
+        <span class="phase-title">Convertir documento a PDF</span>
+      </div>
+
+      <div class="info-box green-box">
+        <strong>DOCX → PDF &nbsp;&nbsp;•&nbsp;&nbsp; PPTX → PDF</strong><br/>
+        Con LibreOffice instalado en el servidor: texto + imágenes + tipografía original.
+      </div>
+
+      <div id="drop1" class="drop-zone" data-accept=".docx,.pptx">
+        <div class="drop-inner">
+          <span class="drop-icon">📂</span>
+          <p class="drop-label">Documento a convertir</p>
+          <p class="drop-formats">DOCX &nbsp;•&nbsp; PPTX</p>
+          <p class="drop-hint">Arrastra aquí o</p>
+          <label class="btn btn-blue">
+            Seleccionar archivo
+            <input type="file" accept=".docx,.pptx" hidden id="file1"/>
+          </label>
+          <p class="drop-filename" id="name1"></p>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-blue btn-lg" id="run1" disabled>⚡ Convertir a PDF</button>
+      </div>
+
+      <div class="progress-wrap" id="prog1-wrap" style="display:none">
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="prog1-fill"></div></div>
+        <p class="progress-msg" id="prog1-msg">Iniciando…</p>
+      </div>
+
+      <div id="result1" class="result-box" style="display:none"></div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         FASE 2
+    ═════════════════════════════════════════════════════════════════════ -->
+    <div id="tab-fase2" class="tab-panel">
+      <div class="panel-header">
+        <span class="phase-label gold">FASE 2</span>
+        <span class="phase-title">PDF → PowerPoint editable</span>
+      </div>
+
+      {% if not poppler_ok %}
+      <div class="info-box warn-box">
+        ⚠️ <strong>Poppler no detectado en el servidor.</strong>
+        El modo Fondo fiel no funcionará. Usa Objetos independientes o contacta al administrador.
+      </div>
+      {% endif %}
+
+      <div class="info-box blue-box">
+        Cada página del PDF se convierte en una diapositiva con imagen de fondo y texto editable.<br/>
+        Edita, reordena o elimina páginas en PowerPoint. Usa Fase 1 para volver a PDF.
+      </div>
+
+      <!-- Opciones -->
+      <div class="options-grid">
+        <div class="option-group">
+          <label class="opt-label">Calidad imagen</label>
+          <div class="radio-row">
+            <label><input type="radio" name="dpi" value="96"/> Baja</label>
+            <label><input type="radio" name="dpi" value="150" checked/> Media ✓</label>
+            <label><input type="radio" name="dpi" value="200"/> Alta</label>
+            <label><input type="radio" name="dpi" value="300"/> Máxima</label>
+          </div>
+        </div>
+        <div class="option-group">
+          <label class="opt-label">Texto editable</label>
+          <div class="radio-row">
+            <label><input type="checkbox" id="include_text" checked/> Incluir texto editable</label>
+          </div>
+          <div class="radio-row" style="margin-top:6px">
+            <label><input type="radio" name="text_mode" value="paragraphs" checked/> Párrafos</label>
+            <label><input type="radio" name="text_mode" value="lines"/> Líneas exactas</label>
+          </div>
+        </div>
+        <div class="option-group">
+          <label class="opt-label">Composición</label>
+          <div class="radio-row">
+            <label><input type="radio" name="comp" value="background" checked/> Fondo fiel</label>
+            <label><input type="radio" name="comp" value="objects"/> Objetos EXP</label>
+          </div>
+          <div class="radio-row" style="margin-top:6px">
+            <label><input type="checkbox" id="preserve_breaks" checked/> Mantener saltos visuales</label>
+          </div>
+        </div>
+      </div>
+
+      <div id="drop2" class="drop-zone" data-accept=".pdf">
+        <div class="drop-inner">
+          <span class="drop-icon">📂</span>
+          <p class="drop-label">PDF a descomponer</p>
+          <p class="drop-formats">PDF</p>
+          <p class="drop-hint">Arrastra aquí o</p>
+          <label class="btn btn-green">
+            Seleccionar archivo
+            <input type="file" accept=".pdf" hidden id="file2"/>
+          </label>
+          <p class="drop-filename" id="name2"></p>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-green btn-lg" id="run2" disabled>🔓 Descomponer PDF</button>
+      </div>
+
+      <div class="progress-wrap" id="prog2-wrap" style="display:none">
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="prog2-fill"></div></div>
+        <p class="progress-msg" id="prog2-msg">Iniciando…</p>
+      </div>
+
+      <div id="result2" class="result-box" style="display:none"></div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════════
+         PDF TABLE RECOVERY
+    ═════════════════════════════════════════════════════════════════════ -->
+    <div id="tab-table" class="tab-panel">
+      <div class="panel-header">
+        <span class="phase-label gold">PDF Table Recovery</span>
+        <span class="phase-title">Recuperar tablas financieras desde PDF</span>
+      </div>
+
+      <div class="info-box warn-box">
+        <strong>⚠️ SOLO para tablas copiadas directamente desde Excel</strong><br/>
+        Funciona cuando en Excel se seleccionó el rango → Copy → Paste en PowerPoint
+        → se convirtió a PDF con LibreOffice o PDF Quick Disassembler.<br/>
+        <strong>NO funciona</strong> con tablas guardadas como PNG, JPG o captura de pantalla.
+      </div>
+
+      <div class="info-box blue-box">
+        <strong>PDF → XLSX + CSV</strong><br/>
+        Escanea todas las páginas automáticamente. Genera un archivo Excel con una hoja
+        por tabla encontrada y un CSV por página como respaldo.
+      </div>
+
+      <!-- Opciones avanzadas -->
+      <div class="options-grid">
+        <div class="option-group">
+          <label class="opt-label">Separación entre columnas</label>
+          <div class="radio-row">
+            <label><input type="radio" name="gap" value="12"/> Estrecha</label>
+            <label><input type="radio" name="gap" value="18" checked/> Normal ✓</label>
+            <label><input type="radio" name="gap" value="28"/> Amplia</label>
+          </div>
+        </div>
+        <div class="option-group">
+          <label class="opt-label">Tamaño máx. fuente tabla</label>
+          <div class="radio-row">
+            <label><input type="radio" name="font_size" value="12"/> 12pt</label>
+            <label><input type="radio" name="font_size" value="16" checked/> 16pt ✓</label>
+            <label><input type="radio" name="font_size" value="22"/> 22pt</label>
+          </div>
+        </div>
+      </div>
+
+      <div id="drop3" class="drop-zone" data-accept=".pdf">
+        <div class="drop-inner">
+          <span class="drop-icon">📂</span>
+          <p class="drop-label">PDF con tablas de Excel</p>
+          <p class="drop-formats">PDF</p>
+          <p class="drop-hint">Arrastra aquí o</p>
+          <label class="btn btn-gold">
+            Seleccionar archivo
+            <input type="file" accept=".pdf" hidden id="file3"/>
+          </label>
+          <p class="drop-filename" id="name3"></p>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-gold btn-lg" id="run3" disabled>📊 Recuperar Tablas Excel</button>
+      </div>
+
+      <div class="progress-wrap" id="prog3-wrap" style="display:none">
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="prog3-fill"></div></div>
+        <p class="progress-msg" id="prog3-msg">Iniciando…</p>
+      </div>
+
+      <div id="result3" class="result-box" style="display:none"></div>
+    </div>
+
+  </main>
+
+  <!-- ── FOOTER ───────────────────────────────────────────────────────────── -->
+  <div class="gold-line"></div>
+  <footer>
+    GoTopo &nbsp;•&nbsp; Democratizando el acceso a la justicia &nbsp;•&nbsp; Costa Rica &nbsp;•&nbsp; 2026
+  </footer>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

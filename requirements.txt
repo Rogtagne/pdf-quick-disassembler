@@ -1,0 +1,20 @@
+# PDF Quick Disassembler v3.4 — dependencias
+# Instalación recomendada en Windows:
+#   python -m venv venv
+#   .\venv\Scripts\activate
+#   pip install -r requirements.txt
+
+pypdf>=6.0.0
+python-docx>=1.2.0
+python-pptx>=1.0.0
+pdf2image>=1.17.0
+Pillow>=12.0.0
+reportlab>=4.5.0
+pdfplumber>=0.11.0
+PyMuPDF>=1.24.0
+openpyxl>=3.1.0
+
+# Opcional: habilita arrastre nativo de archivos en Tkinter.
+# tkinterdnd2>=0.3.0
+flask>=3.0.0
+gunicorn>=22.0.0

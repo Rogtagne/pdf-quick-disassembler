@@ -1,0 +1,39 @@
+# ── Entorno virtual (NUNCA subir a GitHub) ───────────────────────────────────
+venv/
+env/
+.venv/
+ENV/
+
+# ── Cache de Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ── Carpetas de salida generadas por el programa ─────────────────────────────
+TablaExcel_*/
+salida/
+salida_tablas/
+output/
+outputs/
+
+# ── Archivos de prueba ───────────────────────────────────────────────────────
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+*.csv
+!requirements.txt
+
+# ── VS Code (opcional — comentar si quieres versionar la config) ─────────────
+.vscode/
+
+# ── Sistema operativo ────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── OneDrive ─────────────────────────────────────────────────────────────────
+*.tmp
+~$*
