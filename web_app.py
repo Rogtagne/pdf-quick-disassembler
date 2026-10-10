@@ -27,12 +27,15 @@ from flask import (
 
 # ── Asegurar que los motores del proyecto sean importables ────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
+from utils.logging import get_logger
 from topo_vs_pdf import (
     fase1_convert,
     fase2_convert,
     tabla_excel_recover,
     POPPLER_PATH,
 )
+
+log = get_logger("web_app")
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 MAX_MB      = int(os.environ.get("PQD_MAX_MB", 50))
@@ -277,7 +280,10 @@ def api_table_recovery():
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("PDF Quick Disassembler — Servidor Web")
-    print(f"Poppler: {POPPLER_PATH or 'NO ENCONTRADO'}")
-    print("Abre: http://localhost:5000")
+    log.info("PDF Quick Disassembler — Servidor Web")
+    if POPPLER_PATH:
+        log.info("Poppler: %s", POPPLER_PATH)
+    else:
+        log.warning("Poppler: NO ENCONTRADO")
+    log.info("Abre: http://localhost:5000")
     app.run(debug=True, host="0.0.0.0", port=5000)

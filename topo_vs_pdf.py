@@ -15,6 +15,10 @@ import tempfile
 import shutil
 from pathlib import Path
 
+from utils.logging import get_logger
+
+log = get_logger("topo_vs_pdf")
+
 # Tkinter solo se carga en modo desktop (no en servidor web Linux)
 _WEB_MODE = (os.environ.get("PQD_WEB_MODE") == "1"
              or any("gunicorn" in a for a in sys.argv))
@@ -1704,7 +1708,7 @@ if _TKINTER_OK:
             try: __import__(mod)
             except ImportError: missing.append(pkg)
         if missing:
-            print("⚠️  Falta instalar:  pip install", " ".join(missing))
+            log.warning("Falta instalar:  pip install %s", " ".join(missing))
         App().mainloop()
 
     if __name__ == "__main__":
