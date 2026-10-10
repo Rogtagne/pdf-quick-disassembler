@@ -1,10 +1,11 @@
 """
-PDF Quick Disassembler  v3.4  —  Tabla Excel
+PDF Quick Disassembler  v3.6  —  Tablas Fieles
 Produced by GoTopo  —  2026
 
 FASE 1: DOCX / PPTX  →  PDF
 FASE 2: PDF  →  PPTX editable  (fondo fiel o modo objetos independientes)
-TABLA EXCEL: PDF con tablas de Excel  →  XLSX + CSV
+        PDF  →  DOCX editable   (texto corrido que Word reacomoda)
+FASE 3: PDF con tablas de Excel  →  XLSX + CSV
 """
 
 import os
@@ -763,9 +764,289 @@ def fase2_convert(src_path: str, dst_path: str, dpi: int = 150,
 
     if progress_cb:
         if composition_mode == "objects":
-            progress_cb(100, "✅  PPTX listo — objetos independientes")
+            progress_cb(100, "✅  PPTX listo — objetos independientes")          
         else:
-            progress_cb(100, "✅  PPTX listo — fondo fiel + texto editable")
+            progress_cb(100, "✅  PPTX listo — fondo fiel + texto editable")          
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FASE 2 (variante)  —  PDF  →  WORD  (texto corrido editable)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _clean_pdf_text_artifacts(text: str) -> str:
+    """
+    Limpia artefactos típicos de extracción de PDF.
+
+    Los glifos de viñeta de fuentes simbólicas (Symbol, ZapfDingbats) no tienen
+    mapeo Unicode y pdfplumber los devuelve como "(cid:127)" o similar. Se
+    normalizan a una viñeta real para que el texto sea legible y divisible.
+    """
+    import re
+
+    # Códigos conocidos de viñeta en fuentes simbólicas.
+    text = re.sub(r"\(cid:(?:127|183|149|9679|8226)\)", "\u2022", text)
+    # Cualquier otro cid sin mapeo se descarta: es un glifo no representable.
+    text = re.sub(r"\(cid:\d+\)", "", text)
+    return " ".join(text.split())
+
+
+def _split_inline_bullets(text: str):
+    """
+    Divide un bloque que contiene varias viñetas en una entrada por viñeta.
+
+    Al extraer de un PDF, varios ítems de lista pueden llegar unidos en un solo
+    bloque. Word necesita un párrafo por ítem para numerarlos correctamente.
+    """
+    marker = "\u2022"
+    if text.count(marker) < 2:
+        return [text]
+
+    parts = [p.strip() for p in text.split(marker)]
+    return [p for p in parts if p]
+
+
+def _looks_like_numbered_heading(text: str) -> bool:
+    """
+    Distingue un título numerado de un ítem de lista numerada.
+
+    "1. Introduccion" y "2.1 Hallazgos" son títulos de sección: texto corto,
+    sin puntuación final y con una sola frase. Un ítem de lista numerada suele
+    ser una oración más larga.
+    """
+    import re
+
+    stripped = text.strip()
+    if not re.match(r"^\d+(\.\d+)*[\.)]?\s+\S", stripped):
+        return False
+
+    body = re.sub(r"^\d+(\.\d+)*[\.)]?\s+", "", stripped)
+    if len(body) > 70:
+        return False
+    if body.endswith((".", ";", ",")):
+        return False
+    return True
+
+
+def _classify_paragraph_style(block, body_size: float):
+    """
+    Decide el estilo Word de un bloque de párrafo extraído del PDF.
+
+    No se busca replicar el PDF exactamente. La meta es producir un documento
+    Word natural: encabezados como encabezados, listas como listas y cuerpo
+    como texto corrido que Word pueda reacomodar libremente al editar.
+
+    Retorna: "h1" | "h2" | "h3" | "list" | "body"
+    """
+    text = (block.get("text") or "").strip()
+    size = float(block.get("size", body_size) or body_size)
+    bold = bool(block.get("bold"))
+
+    if not text:
+        return "body"
+
+    ratio = size / body_size if body_size else 1.0
+    short = len(text) < 120
+    single_line = int(block.get("line_count", 1)) <= 2
+
+    # Un título numerado ("2. Hallazgos") no es un ítem de lista.
+    if _looks_like_numbered_heading(text):
+        if ratio >= 1.55:
+            return "h1"
+        if ratio >= 1.22:
+            return "h2"
+        return "h3"
+
+    if _is_bullet_or_numbered(text):
+        return "list"
+
+    # Un bloque corto, más grande que el cuerpo, es casi siempre un título.
+
+    if short and single_line:
+        if ratio >= 1.45:
+            return "h1"
+        if ratio >= 1.22:
+            return "h2"
+        if ratio >= 1.08 or bold:
+            return "h3"
+
+    return "body"
+
+
+def _strip_list_marker(text: str) -> str:
+    """Quita el bullet o numeral inicial; Word aporta su propia viñeta."""
+    import re
+    return re.sub(r"^(\u2022|\-|\*|\d+[\.)]|[a-zA-Z][\.)])\s+", "", text.strip())
+
+
+def _estimate_body_size(text_pages) -> float:
+    """
+    Estima el tamaño de fuente del cuerpo del documento.
+
+    Se usa la moda aproximada ponderada por cantidad de texto, porque el cuerpo
+    es lo que más caracteres aporta. Así los títulos se detectan por contraste
+    contra el cuerpo real y no contra un valor fijo.
+    """
+    from collections import Counter
+
+    counter: "Counter" = Counter()
+    for _pw, _ph, blocks in text_pages:
+        for blk in blocks:
+            size = round(float(blk.get("size", 11) or 11), 1)
+            counter[size] += max(len(blk.get("text") or ""), 1)
+
+    if not counter:
+        return 11.0
+    return float(counter.most_common(1)[0][0])
+
+
+def fase2_word_convert(src_path: str, dst_path: str,
+                       include_images: bool = True,
+                       image_dpi: int = 150,
+                       progress_cb=None) -> bool:
+    """
+    Convierte un PDF a un documento Word (.docx) de texto corrido editable.
+
+    Enfoque:
+        El texto se escribe como párrafos reales de Word, no como cajas
+        flotantes posicionadas. Word reacomoda el contenido al editar, igual
+        que en un documento nativo. Se pierde la posición exacta del PDF y se
+        gana edición natural, que es el objetivo de esta salida.
+
+    Diferencia con fase2_convert (PPTX):
+        - PPTX conserva el layout visual para corregir presentaciones.
+        - DOCX conserva el contenido para reescribir y corregir texto.
+
+    Parámetros:
+        include_images  Inserta las imágenes del PDF en su orden de aparición.
+        image_dpi       Resolución de rasterizado de esas imágenes.
+    """
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    import io
+
+    src = Path(src_path)
+
+    if progress_cb:
+        progress_cb(5, "Leyendo PDF…")
+
+    # Texto agrupado en párrafos: es la base del documento Word.
+    text_pages = _extract_text_blocks(str(src), mode="paragraphs")
+
+    if not text_pages:
+        raise RuntimeError("No se pudo leer texto del PDF")
+
+    body_size = _estimate_body_size(text_pages)
+
+    if progress_cb:
+        progress_cb(18, f"Texto extraído (cuerpo ≈ {body_size:g} pt)")
+
+    # Imágenes por página, en orden de aparición vertical.
+    image_pages = []
+    if include_images:
+        if progress_cb:
+            progress_cb(25, "Extrayendo imágenes…")
+        try:
+            image_pages = _extract_pdf_image_regions(str(src), dpi=image_dpi)
+        except Exception:
+            image_pages = []
+
+    doc = Document()
+
+    # Estilo base del documento: cuerpo legible y ancho de página carta.
+    normal = doc.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = Pt(11)
+
+    total_pages = len(text_pages)
+    empty_doc   = True
+
+    for page_index, (pw, ph, blocks) in enumerate(text_pages):
+        if progress_cb:
+            pct = 30 + int(60 * (page_index / max(total_pages, 1)))
+            progress_cb(pct, f"Componiendo página {page_index + 1}/{total_pages}…")
+
+        page_images = image_pages[page_index] if page_index < len(image_pages) else []
+
+        # Se intercala texto e imágenes según su posición vertical en la página,
+        # de modo que una foto entre dos párrafos quede entre esos párrafos.
+        items = []
+        for blk in blocks:
+            if (blk.get("text") or "").strip():
+                items.append((float(blk.get("y0", 0)), "text", blk))
+        for img in page_images:
+            items.append((float(img.get("y0", 0)), "image", img))
+
+        items.sort(key=lambda item: item[0])
+
+        for _y, kind, payload in items:
+            if kind == "image":
+                try:
+                    width_pt = float(payload["x1"]) - float(payload["x0"])
+                    # Ancho útil de página carta con márgenes por defecto.
+                    width_in = min(max(width_pt / 72.0, 0.6), 6.5)
+                    stream = io.BytesIO(payload["png"])
+                    para = doc.add_paragraph()
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    para.add_run().add_picture(stream, width=Inches(width_in))
+                    empty_doc = False
+                except Exception:
+                    # Una imagen ilegible no debe abortar el documento completo.
+                    continue
+                continue
+
+            blk   = payload
+            text  = _clean_pdf_text_artifacts(blk.get("text") or "")
+            if not text:
+                continue
+            style = _classify_paragraph_style(blk, body_size)
+
+            # Varias viñetas unidas en un bloque: una entrada de lista por ítem.
+            pieces = _split_inline_bullets(text)
+            if len(pieces) > 1:
+                for piece in pieces:
+                    doc.add_paragraph(_strip_list_marker(piece),
+                                       style="List Bullet")
+                empty_doc = False
+                continue
+
+            if style == "h1":
+                para = doc.add_heading(text, level=1)
+            elif style == "h2":
+                para = doc.add_heading(text, level=2)
+            elif style == "h3":
+                para = doc.add_heading(text, level=3)
+            elif style == "list":
+                para = doc.add_paragraph(_strip_list_marker(text),
+                                          style="List Bullet")
+            else:
+                para = doc.add_paragraph(text)
+                para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                if blk.get("bold"):
+                    for run in para.runs:
+                        run.bold = True
+
+            empty_doc = False
+
+        # Salto de página entre páginas del PDF, salvo en la última.
+        if page_index < total_pages - 1:
+            doc.add_page_break()
+
+    if empty_doc:
+        doc.add_paragraph(
+            "No se encontró texto embebido en este PDF. "
+            "Si el documento es un escaneo de imagen, se requiere OCR."
+        )
+
+    if progress_cb:
+        progress_cb(95, "Guardando DOCX…")
+
+    doc.save(dst_path)
+
+    if progress_cb:
+        progress_cb(100, "✅  Word listo — texto corrido editable")
+
     return True
 
 
@@ -806,6 +1087,9 @@ class _RecoveredPage:
     height: float
     word_count: int
     rows: List[List[str]]
+    method: str = "bandas"          # "rejilla" o "bandas"
+    suspicious: set = None          # coordenadas (fila, col) dudosas
+    audit: dict = None              # conteo por tipo de sospecha
 
 
 def _parse_crop(value: Optional[str]):
@@ -857,22 +1141,193 @@ def _normalize_financial_cell(text: str) -> str:
 
 
 def _get_words_table(page, max_font_size: float, crop):
+    """
+    Extrae palabras de una página para reconstrucción de tabla.
+
+    Dos decisiones importantes, ambas producto de casos reales:
+
+    1) use_text_flow=True
+       Cuando una tabla de Excel se pega en Word como metarchivo vectorial,
+       el PDF posiciona cada glifo por separado. Sin este parámetro pdfplumber
+       devuelve un token por carácter y el texto sale como "R e s u l t a d o".
+
+    2) NO se pasa "size" en extra_attrs
+       pdfplumber corta palabra cada vez que un atributo cambia, y en esos
+       metarchivos el tamaño difiere en el octavo decimal entre glifos
+       (7.145899333 vs 7.145899415). Eso bastaba para fragmentar todo.
+       El filtro de tamaño se hace con la altura del token, que es estable.
+    """
     target = page.crop(crop) if crop else page
     words  = target.extract_words(
         x_tolerance=2, y_tolerance=3,
-        keep_blank_chars=False, use_text_flow=False,
-        extra_attrs=["size", "fontname"],
+        keep_blank_chars=False, use_text_flow=True,
     ) or []
+
     filtered = []
     for w in words:
         text = str(w.get("text", "")).strip()
         if not text:
             continue
-        size = float(w.get("size", 10) or 10)
-        if size > max_font_size:
+        # Altura del token como aproximación del tamaño de fuente.
+        height = float(w.get("bottom", 0)) - float(w.get("top", 0))
+        if height > max_font_size * 1.35:
             continue
         filtered.append(w)
     return filtered
+
+
+def _is_thousands_continuation(text: str) -> bool:
+    """
+    Reconoce el resto de un monto partido por ancho de celda.
+
+    Solo acepta un grupo de millar suelto, con paréntesis de cierre opcional:
+        "279", "651)", "08"
+    Se exige que sean dígitos puros para no absorber etiquetas ni otro monto.
+    """
+    import re
+    return bool(re.fullmatch(r"\d{1,3}\)?", text.strip()))
+
+
+def _is_money_like(text: str) -> bool:
+    """Monto o porcentaje que podría venir cortado por wrap de celda."""
+    import re
+    return bool(re.fullmatch(r"[\(\-]?\$?[\d.,]+\)?%?", text.strip()))
+
+
+def _merge_side_thousands(words, max_gap: float = 8.0):
+    """
+    Une los grupos de millar que van uno al lado del otro en el mismo renglón.
+
+    El separador de miles en estos estados financieros es un espacio, así que
+    "$670 279" llega como dos tokens. Unirlos antes de agrupar columnas evita
+    que cada mitad genere su propia columna y que un monto quede partido en dos
+    celdas, que es justo el error que hace dudar de toda la tabla.
+    """
+    ordered = sorted(words, key=lambda w: (float(w["top"]), float(w["x0"])))
+    consumed = set()
+    result   = []
+
+    for i, head in enumerate(ordered):
+        if i in consumed:
+            continue
+
+        text   = str(head.get("text", ""))
+        x1     = float(head["x1"])
+        mid    = (float(head["top"]) + float(head["bottom"])) / 2
+        bottom = float(head["bottom"])
+
+        if _is_money_like(text):
+            # Se admiten varios grupos seguidos: "$1 234 567".
+            advanced = True
+            while advanced:
+                advanced = False
+                for j, nxt in enumerate(ordered):
+                    if j in consumed or j == i:
+                        continue
+                    nxt_mid = (float(nxt["top"]) + float(nxt["bottom"])) / 2
+                    if abs(nxt_mid - mid) > 2.5:
+                        continue
+                    if not (0 <= (float(nxt["x0"]) - x1) <= max_gap):
+                        continue
+                    if not _is_thousands_continuation(str(nxt.get("text", ""))):
+                        continue
+                    text = text + " " + str(nxt["text"])
+                    x1   = float(nxt["x1"])
+                    bottom = max(bottom, float(nxt["bottom"]))
+                    consumed.add(j)
+                    advanced = True
+                    break
+
+        merged = dict(head)
+        merged["text"]   = text
+        merged["x1"]     = x1
+        merged["bottom"] = bottom
+        result.append(merged)
+
+    return result
+
+
+def _merge_wrapped_numbers(words, tol_x: float = 1.8, max_gap: float = 6.0):
+    """
+    Une montos partidos en dos líneas dentro de una misma celda.
+
+    Cuando la celda de Word es más angosta que el número, "$670 279" se
+    imprime en dos líneas. El agrupador por bandas las ve como dos filas
+    distintas y el número queda cortado y descolocado: ese es el fallo que
+    hace desconfiar de toda la conversión.
+
+    Regla deliberadamente estricta, para no inventar datos:
+        - el fragmento de abajo debe ser dígitos puros (grupo de millar)
+        - debe compartir el borde derecho con el monto de arriba
+          (los montos van alineados a la derecha, así que x1 coincide)
+        - el hueco vertical debe ser de una línea, no de una fila
+        - una sola unión por monto, sin encadenar
+
+    Sin encadenar es esencial: de lo contrario "$670 279" seguiría absorbiendo
+    el monto de la fila siguiente por compartir el mismo borde derecho.
+    """
+    ordered = sorted(words, key=lambda w: (float(w["top"]), float(w["x0"])))
+    consumed = set()
+    result   = []
+
+    for i, upper in enumerate(ordered):
+        if i in consumed:
+            continue
+
+        text = str(upper.get("text", ""))
+
+        if _is_money_like(text):
+            # Si el monto ya continúa a la derecha en el mismo renglón, está
+            # completo y no hay wrap. Verificarlo evita el error inverso:
+            # absorber el número de la fila de abajo cuando no hacía falta.
+            upper_mid = (float(upper["top"]) + float(upper["bottom"])) / 2
+            has_side_continuation = any(
+                abs(((float(o["top"]) + float(o["bottom"])) / 2) - upper_mid) < 2.5
+                and 0 <= (float(o["x0"]) - float(upper["x1"])) <= 8
+                and _is_thousands_continuation(str(o.get("text", "")))
+                for k, o in enumerate(ordered) if k != i
+            )
+
+            if not has_side_continuation:
+                for j in range(i + 1, len(ordered)):
+                    if j in consumed:
+                        continue
+                    lower = ordered[j]
+                    gap   = float(lower["top"]) - float(upper["bottom"])
+
+                    if gap > max_gap:
+                        break          # ya estamos en otra fila
+                    if gap < -2:
+                        continue       # mismo renglón, no es continuación
+
+                    same_right = abs(float(lower["x1"]) - float(upper["x1"])) <= tol_x
+                    if not same_right:
+                        continue
+                    if not _is_thousands_continuation(str(lower.get("text", ""))):
+                        continue
+
+                    # El fragmento de abajo no puede ser el grupo de millar de
+                    # un monto de su propia fila. Si tiene un monto pegado a su
+                    # izquierda, ya pertenece a ese monto y no es continuación.
+                    lower_mid = (float(lower["top"]) + float(lower["bottom"])) / 2
+                    belongs_to_own_row = any(
+                        abs(((float(o["top"]) + float(o["bottom"])) / 2) - lower_mid) < 2.5
+                        and 0 <= (float(lower["x0"]) - float(o["x1"])) <= 8
+                        and _is_money_like(str(o.get("text", "")))
+                        for k, o in enumerate(ordered) if k != j
+                    )
+                    if belongs_to_own_row:
+                        continue
+
+                    text = text + " " + str(lower["text"])
+                    consumed.add(j)
+                    break          # una sola unión
+
+        merged = dict(upper)
+        merged["text"] = text
+        result.append(merged)
+
+    return result
 
 
 def _group_words_into_lines_table(words, y_tol: float):
@@ -928,27 +1383,393 @@ def _words_to_cells_table(line, gap_tol: float) -> List[_Cell]:
     return cells
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  FASE 3  —  RECONSTRUCCIÓN POR REJILLA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _collapse_edges(values, tol: float = 3.0):
+    """Agrupa coordenadas casi iguales en un solo borde."""
+    edges = []
+    for v in sorted(values):
+        if not edges or (v - edges[-1]) > tol:
+            edges.append(v)
+    return edges
+
+
+def _collect_grid_edges(page, min_span: float = 25.0):
+    """
+    Deriva los bordes de columna y fila a partir de la rejilla dibujada en el PDF.
+
+    Dos orígenes posibles, según cómo se creó la tabla:
+        - Rectángulos: bordes de celda de una tabla de Word.
+        - Líneas: cuadrícula de Excel cuando se pegó como metarchivo vectorial.
+
+    Retorna (xs, ys) o (None, None) si el PDF no trae rejilla utilizable.
+    """
+    xs, ys = set(), set()
+
+    for rect in getattr(page, "rects", []) or []:
+        try:
+            x0, x1 = float(rect["x0"]), float(rect["x1"])
+            y0, y1 = float(rect["top"]), float(rect["bottom"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (x1 - x0) >= 2 or (y1 - y0) >= 2:
+            xs.update((round(x0, 1), round(x1, 1)))
+            ys.update((round(y0, 1), round(y1, 1)))
+
+    # Las cuadrículas de Excel suelen venir dibujadas en segmentos cortos, uno
+    # por celda. Exigir que cada segmento sea largo descarta casi toda la
+    # rejilla, así que se acumula la "tinta" por coordenada y se conserva la
+    # coordenada cuando el total suma una extensión significativa.
+    ink_x: dict = {}
+    ink_y: dict = {}
+
+    for source in ("lines", "curves"):
+        for item in getattr(page, source, []) or []:
+            try:
+                x0, x1 = float(item["x0"]), float(item["x1"])
+                y0, y1 = float(item["top"]), float(item["bottom"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if abs(x1 - x0) < 1.5 and abs(y1 - y0) >= 1.5:            # vertical
+                key = round((x0 + x1) / 2, 0)
+                ink_x[key] = ink_x.get(key, 0.0) + abs(y1 - y0)
+            elif abs(y1 - y0) < 1.5 and abs(x1 - x0) >= 1.5:          # horizontal
+                key = round((y0 + y1) / 2, 0)
+                ink_y[key] = ink_y.get(key, 0.0) + abs(x1 - x0)
+
+    # Umbral de tinta: descarta marcas aisladas y conserva bordes reales.
+    xs.update(k for k, total in ink_x.items() if total >= 12)
+    ys.update(k for k, total in ink_y.items() if total >= 12)
+
+    xs = _collapse_edges(xs)
+    ys = _collapse_edges(ys)
+
+    # Una rejilla utilizable necesita al menos 3 columnas y 3 filas,
+    # y cubrir una extensión razonable de la página.
+    if len(xs) < 4 or len(ys) < 4:
+        return None, None
+    if (xs[-1] - xs[0]) < min_span or (ys[-1] - ys[0]) < min_span:
+        return None, None
+
+    return xs, ys
+
+
+def _band_index(edges, value: float) -> int:
+    """Índice de la banda de la rejilla en la que cae un valor."""
+    index = -1
+    for i, edge in enumerate(edges):
+        if value >= edge:
+            index = i
+        else:
+            break
+    if index >= len(edges) - 1:
+        return len(edges) - 2
+    return index
+
+
+def _cluster_column_bounds(words, tol: float = 6.0):
+    """
+    Deriva los límites de columna a partir de los montos, no de todo el texto.
+
+    En una tabla financiera las cifras van alineadas a la derecha y forman
+    columnas muy definidas, mientras que las etiquetas son de ancho irregular
+    y romperían el agrupamiento en decenas de columnas falsas.
+
+    Por eso se agrupan los bordes derechos solo de las celdas numéricas, y todo
+    lo que quede a la izquierda de la primera cifra se trata como una única
+    columna de etiquetas.
+    """
+    # Solo montos con cuerpo real definen columna. Tokens como "26" de un
+    # encabezado "enero-26" partido en dos líneas crearían columnas falsas.
+    def _is_real_amount(text: str) -> bool:
+        s = text.strip()
+        if not _looks_numeric_financial(s):
+            return False
+        digits = sum(1 for ch in s if ch.isdigit())
+        return ("$" in s) or ("," in s) or digits >= 4
+
+    numeric = [w for w in words if _is_real_amount(str(w.get("text", "")))]
+    source  = numeric if len(numeric) >= 6 else words
+
+    edges = []
+    for x in sorted(float(w["x1"]) for w in source):
+        if not edges or (x - edges[-1][-1]) > tol:
+            edges.append([x])
+        else:
+            edges[-1].append(x)
+
+    centers = [sum(group) / len(group) for group in edges]
+    if len(centers) < 2:
+        return None
+
+    # Divisiones a mitad de camino entre columnas contiguas.
+    splits = [(centers[i] + centers[i + 1]) / 2 for i in range(len(centers) - 1)]
+
+    # Frontera de la columna de etiquetas: justo antes de la primera cifra.
+    if numeric and len(numeric) >= 6:
+        first_number_x0 = min(float(w["x0"]) for w in numeric)
+        label_edge = first_number_x0 - 2
+        if all(label_edge < s for s in splits):
+            splits.insert(0, label_edge)
+
+    return [float("-inf")] + splits + [float("inf")]
+
+
+def _recover_page_grid(page, page_number: int, min_words: int,
+                        max_font_size: float, crop):
+    """
+    Reconstruye la tabla combinando dos fuentes de información.
+
+    Columnas: los bordes verticales dibujados en el PDF, cuando existen y son
+    coherentes. Es lo más fiel, porque no estima dónde empieza cada columna.
+    Si el PDF no trae rejilla usable, se agrupan los bordes derechos del texto.
+
+    Filas: las líneas de texto. La rejilla horizontal resultó poco confiable en
+    la práctica, porque muchas hojas de Excel solo dibujan separadores de grupo
+    y no una línea por fila.
+
+    Antes de todo se unen los montos partidos por ancho de celda, que es el
+    fallo que descoloca los datos y hace desconfiar de la conversión completa.
+
+    Retorna (rows, n_columnas) o (None, 0) si la página no da para tabla.
+    """
+    words = _get_words_table(page, max_font_size=max_font_size, crop=crop)
+    if len(words) < min_words:
+        return None, 0
+
+    xs, ys = _collect_grid_edges(page)
+
+    # Recortar al área de la tabla: deja fuera títulos y párrafos del documento.
+    if xs and ys:
+        # Solo se recorta en vertical. La columna de etiquetas suele quedar a la
+        # izquierda del primer borde de la rejilla, así que recortar en X la
+        # eliminaría junto con el texto del documento.
+        y_min, y_max = ys[0] - 3, ys[-1] + 3
+        inside = [
+            w for w in words
+            if y_min <= ((float(w["top"]) + float(w["bottom"])) / 2) <= y_max
+            and float(w["x1"]) <= xs[-1] + 6
+        ]
+        if len(inside) >= min_words * 0.4:
+            words = inside
+
+    # Primero los grupos de millar contiguos, luego los montos partidos por
+    # wrap. El orden importa: unir lateralmente primero deja montos completos
+    # y evita confundir un grupo de millar con una continuación de otra fila.
+    words = _merge_side_thousands(words)
+    words = _merge_wrapped_numbers(words)
+
+    # ── Límites de columna ───────────────────────────────────────────────────
+    # Una rejilla con demasiadas divisiones suele venir de bordes internos de
+    # Word y parte las etiquetas; en ese caso se prefiere el agrupamiento.
+    bounds = None
+    if xs and 3 <= (len(xs) - 1) <= 15:
+        # Todos los bordes se usan como divisiones, y se agregan extremos
+        # abiertos: el de la izquierda recoge la columna de etiquetas.
+        bounds = [float("-inf")] + list(xs) + [float("inf")]
+
+    if bounds is None:
+        bounds = _cluster_column_bounds(words)
+    if not bounds:
+        return None, 0
+
+    n_cols = len(bounds) - 1
+
+    # ── Filas desde las líneas de texto ──────────────────────────────────────
+    lines = _group_words_into_lines_table(words, y_tol=4.0)
+    if not lines:
+        return None, 0
+
+    rows_out: List[List[str]] = []
+
+    for line in lines:
+        cells = [[] for _ in range(n_cols)]
+        for w in line:
+            cx = (float(w["x0"]) + float(w["x1"])) / 2
+            idx = _band_index(bounds, cx)
+            idx = max(0, min(idx, n_cols - 1))
+            cells[idx].append((float(w["x0"]), str(w["text"])))
+
+        row = []
+        for fragments in cells:
+            if not fragments:
+                row.append("")
+                continue
+            text = " ".join(t for _x, t in sorted(fragments))
+            row.append(_normalize_financial_cell(text))
+
+        while row and not row[-1].strip():
+            row.pop()
+
+        if any(c.strip() for c in row):
+            rows_out.append(row)
+
+    # ── Compactar filas partidas por wrap desigual ───────────────────────────
+    # Cuando unas celdas de la fila hacen wrap y otras no, las que caben quedan
+    # centradas y aterrizan en una línea de texto aparte. El valor es correcto
+    # pero aparece en una fila extra, lo que da la impresión de dato descolocado.
+    # Solo se fusiona cuando no hay ninguna columna ocupada en ambas filas, así
+    # que nunca se sobrescribe un dato con otro.
+    compacted: List[List[str]] = []
+    for row in rows_out:
+        filled = [i for i, c in enumerate(row) if c.strip()]
+
+        if compacted and len(filled) <= 3:
+            previous = compacted[-1]
+            prev_filled = {i for i, c in enumerate(previous) if c.strip()}
+
+            # La fila dispersa no puede traer etiqueta propia ni chocar.
+            has_label = bool(row) and bool(row[0].strip())
+            collision = any(i in prev_filled for i in filled)
+
+            if filled and not collision and not has_label and len(prev_filled) >= 2:
+                while len(previous) < len(row):
+                    previous.append("")
+                for i in filled:
+                    previous[i] = row[i]
+                continue
+
+        compacted.append(list(row))
+
+    rows_out = compacted
+
+    # ── Descartar filas de prosa del documento ───────────────────────────────
+    # Una fila de tabla tiene varias celdas; un párrafo cae todo en pocas.
+    filtered = []
+    for row in rows_out:
+        filled  = sum(1 for c in row if c.strip())
+        numeric = sum(1 for c in row if _looks_numeric_financial(c))
+        if filled >= 3 or numeric >= 2:
+            filtered.append(row)
+
+    if len(filtered) < 3:
+        return None, 0
+
+    return filtered, n_cols
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FASE 3  —  AUDITORÍA DE INTEGRIDAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _audit_recovered_rows(rows):
+    """
+    Marca las celdas que podrían contener un número incompleto.
+
+    El riesgo real de esta función no es equivocarse: es equivocarse en
+    silencio. Un monto partido que queda descolocado hace que el usuario
+    pierda la confianza en toda la tabla, y lo sensato entonces es descartar
+    la conversión completa.
+
+    Por eso se señalan las celdas dudosas en el Excel, en lugar de suponer
+    que todo salió bien. Señales tomadas como sospechosas:
+
+        - Un grupo de millar suelto ("279") sin símbolo ni separador: casi
+          siempre es la segunda mitad de un monto partido.
+        - Una celda con dos o más montos pegados: columnas que se fusionaron.
+
+    Retorna (coordenadas_sospechosas, resumen_por_tipo).
+    """
+    import re
+
+    suspicious = set()
+    summary = {"fragmento": 0, "fusionada": 0}
+
+    orphan_group = re.compile(r"^\d{1,3}\)?$")
+    money_token  = re.compile(r"[\(\-]?\$\s?[\d.,\s]+\)?")
+
+    for r, row in enumerate(rows):
+        for c, cell in enumerate(row):
+            text = (cell or "").strip()
+            if not text:
+                continue
+
+            # Grupo de millar suelto: probable mitad de un monto.
+            if orphan_group.match(text):
+                suspicious.add((r, c))
+                summary["fragmento"] += 1
+                continue
+
+            # Varios montos en una sola celda: columnas fusionadas.
+            if len(money_token.findall(text)) >= 2:
+                suspicious.add((r, c))
+                summary["fusionada"] += 1
+                continue
+
+            # Varios porcentajes en una sola celda.
+            if text.count("%") >= 2:
+                suspicious.add((r, c))
+                summary["fusionada"] += 1
+
+    return suspicious, summary
+
+
 def _recover_page_table(page, page_number: int, min_words: int,
                          max_font_size: float, y_tol: float,
-                         gap_tol: float, crop) -> Optional[_RecoveredPage]:
+                         gap_tol: float, crop,
+                         prefer_grid: bool = True) -> Optional[_RecoveredPage]:
+    """
+    Recupera la tabla de una página con dos estrategias en orden de calidad.
+
+    1) Rejilla — usa los bordes de celda dibujados en el PDF. Es el método
+       fiel: no adivina dónde empieza cada columna.
+    2) Bandas — agrupa por altura y separa por huecos horizontales. Es el
+       comportamiento histórico y sirve cuando el PDF no trae rejilla.
+
+    El método usado queda registrado en el resultado, porque al usuario le
+    importa saber si la tabla vino de la rejilla real o de una estimación.
+    """
     words = _get_words_table(page, max_font_size=max_font_size, crop=crop)
     if len(words) < min_words:
         return None
-    lines = _group_words_into_lines_table(words, y_tol=y_tol)
-    rows: List[List[str]] = []
-    for line in lines:
-        cells = _words_to_cells_table(line, gap_tol=gap_tol)
-        if cells:
-            rows.append([c.text for c in cells])
-    table_like = sum(1 for r in rows if len(r) >= 2)
-    if table_like < 5:
-        return None
+
+    rows: Optional[List[List[str]]] = None
+    method = "bandas"
+
+    # ── Estrategia 1: rejilla ────────────────────────────────────────────────
+    if prefer_grid:
+        try:
+            grid_rows, _cols = _recover_page_grid(
+                page,
+                page_number=page_number,
+                min_words=min_words,
+                max_font_size=max_font_size,
+                crop=crop,
+            )
+            if grid_rows:
+                rows = grid_rows
+                method = "rejilla"
+        except Exception:
+            rows = None
+
+    # ── Estrategia 2: bandas (respaldo) ──────────────────────────────────────
+    if rows is None:
+        merged = _merge_wrapped_numbers(_merge_side_thousands(words))
+        lines  = _group_words_into_lines_table(merged, y_tol=y_tol)
+        rows   = []
+        for line in lines:
+            cells = _words_to_cells_table(line, gap_tol=gap_tol)
+            if cells:
+                rows.append([c.text for c in cells])
+
+        table_like = sum(1 for r in rows if len(r) >= 2)
+        if table_like < 5:
+            return None
+
+    suspicious, audit = _audit_recovered_rows(rows)
+
     return _RecoveredPage(
         page_number=page_number,
         width=float(page.width),
         height=float(page.height),
         word_count=len(words),
         rows=rows,
+        method=method,
+        suspicious=suspicious,
+        audit=audit,
     )
 
 
@@ -963,43 +1784,126 @@ def _export_csv_tables(pages: List[_RecoveredPage], out_dir: Path) -> List[Path]
 
 
 def _export_xlsx_tables(pages: List[_RecoveredPage], out_path: Path) -> Optional[Path]:
+    """
+    Exporta las tablas recuperadas a Excel, señalando lo que conviene revisar.
+
+    Las celdas dudosas se pintan en ámbar y llevan un comentario. La idea es
+    que el usuario sepa exactamente dónde mirar en lugar de tener que verificar
+    la tabla entera o descartarla por desconfianza.
+    """
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Border, Side
+        from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+        from openpyxl.comments import Comment
         from openpyxl.utils import get_column_letter
-    except Exception as e:
+    except Exception:
         return None
 
-    wb   = Workbook()
-    thin = Side(style="thin", color="DDDDDD")
-    header_fill = PatternFill("solid", fgColor="E8F1FF")
+    wb = Workbook()
+    thin         = Side(style="thin", color="DDDDDD")
+    header_fill  = PatternFill("solid", fgColor="E8F1FF")
+    warn_fill    = PatternFill("solid", fgColor="FFE4B5")   # ámbar: revisar
+    grid_fill    = PatternFill("solid", fgColor="E8F5EE")   # verde: rejilla
+    band_fill    = PatternFill("solid", fgColor="FFF4E0")   # crema: bandas
 
     if pages and wb.active:
         wb.remove(wb.active)
 
+    total_warn = 0
+
     for rp in pages:
         ws_name = _re.sub(r"[\\/*?:\[\]]", "_", f"Pagina_{rp.page_number}")[:31]
         ws = wb.create_sheet(ws_name)
-        ws.append([f"Página {rp.page_number}", f"Palabras seleccionables: {rp.word_count}"])
-        ws.append([])
+
+        suspicious = rp.suspicious or set()
+        audit      = rp.audit or {}
+        total_warn += len(suspicious)
+
+        # ── Encabezado informativo ───────────────────────────────────────────
+        metodo_txt = ("Rejilla del PDF (fiel)" if rp.method == "rejilla"
+                      else "Bandas de texto (estimado)")
+        ws.append([f"Página {rp.page_number}", f"Método: {metodo_txt}"])
+        ws.cell(1, 1).font = Font(bold=True, size=12)
+        ws.cell(1, 2).font = Font(bold=True)
+        ws.cell(1, 2).fill = grid_fill if rp.method == "rejilla" else band_fill
+
+        if suspicious:
+            ws.append([
+                f"⚠ {len(suspicious)} celda(s) a revisar",
+                f"Posibles números partidos: {audit.get('fragmento', 0)}  |  "
+                f"Posibles columnas fusionadas: {audit.get('fusionada', 0)}",
+            ])
+            ws.cell(2, 1).font = Font(bold=True, color="B36B00")
+            ws.cell(2, 2).font = Font(color="B36B00")
+        else:
+            ws.append(["✓ Sin celdas dudosas detectadas", ""])
+            ws.cell(2, 1).font = Font(bold=True, color="107C41")
+
+        # Fila separadora. No se usa ws.max_row para ubicar los datos porque
+        # una fila vacía avanza el cursor sin registrar celdas, y eso desplaza
+        # el marcado de las celdas dudosas una fila hacia arriba.
+        ws.append([""])
+        data_start = 4
+
+        # ── Datos ────────────────────────────────────────────────────────────
         for row in rp.rows:
             ws.append(row)
+
         max_cols = max((len(r) for r in rp.rows), default=1)
+
+        # ── Marcado de celdas dudosas ────────────────────────────────────────
+        for (r_idx, c_idx) in suspicious:
+            cell = ws.cell(data_start + r_idx, c_idx + 1)
+            cell.fill = warn_fill
+            cell.font = Font(bold=True, color="8B4500")
+            try:
+                cell.comment = Comment(
+                    "Revisar: este valor puede estar incompleto o fusionado "
+                    "con otra columna. Compare contra el PDF original.",
+                    "PDF Quick Disassembler",
+                )
+            except Exception:
+                pass
+
+        # ── Bordes y ancho de columna ────────────────────────────────────────
         for col_idx in range(1, max_cols + 1):
-            max_len = 8
-            for row_idx in range(1, ws.max_row + 1):
-                val = ws.cell(row_idx, col_idx).value
-                if val is not None:
-                    max_len = max(max_len, min(len(str(val)) + 2, 42))
-                ws.cell(row_idx, col_idx).border = Border(
-                    top=thin, left=thin, right=thin, bottom=thin)
-            ws.column_dimensions[get_column_letter(col_idx)].width = max_len
-        for row_idx in range(3, min(ws.max_row, 5) + 1):
+            width = 8
+            for row_idx in range(data_start, ws.max_row + 1):
+                cell = ws.cell(row_idx, col_idx)
+                if cell.value is not None:
+                    width = max(width, min(len(str(cell.value)) + 2, 42))
+                cell.border = Border(top=thin, left=thin,
+                                      right=thin, bottom=thin)
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        # ── Primeras filas de datos como encabezado visual ───────────────────
+        for row_idx in range(data_start, min(ws.max_row, data_start + 1) + 1):
             for col_idx in range(1, max_cols + 1):
-                c = ws.cell(row_idx, col_idx)
-                c.font = Font(bold=True)
-                c.fill = header_fill
-        ws.freeze_panes = "A4"
+                cell = ws.cell(row_idx, col_idx)
+                if (row_idx - data_start, col_idx - 1) in suspicious:
+                    continue
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+
+        ws.freeze_panes = ws.cell(data_start + 1, 1).coordinate
+
+    # ── Hoja resumen cuando hay varias páginas ───────────────────────────────
+    if len(pages) > 1:
+        summary = wb.create_sheet("Resumen", 0)
+        summary.append(["Página", "Método", "Filas", "Celdas a revisar"])
+        for c in range(1, 5):
+            summary.cell(1, c).font = Font(bold=True)
+            summary.cell(1, c).fill = header_fill
+        for rp in pages:
+            summary.append([
+                rp.page_number,
+                "Rejilla del PDF" if rp.method == "rejilla" else "Bandas (estimado)",
+                len(rp.rows),
+                len(rp.suspicious or set()),
+            ])
+        for col, width in zip("ABCD", (10, 22, 10, 18)):
+            summary.column_dimensions[col].width = width
 
     wb.save(out_path)
     return out_path
@@ -1045,7 +1949,8 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
 
     if not recovered:
         if progress_cb: progress_cb(100, "⚠️  Sin tablas compatibles encontradas")
-        return {"recovered": 0, "xlsx": None, "csvs": [], "msg": "sin_tablas"}
+        return {"recovered": 0, "xlsx": None, "csvs": [], "msg": "sin_tablas",
+                "grid_pages": 0, "band_pages": 0, "warn_cells": 0}
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1056,12 +1961,26 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
     stem  = Path(src_path).stem
     xlsx  = _export_xlsx_tables(recovered, out_dir / f"{stem}_tablas_recuperadas.xlsx")
 
-    if progress_cb: progress_cb(100, f"✅  {len(recovered)} tabla(s) recuperadas")
+    # Resumen de calidad: al usuario le importa saber si puede confiar
+    # en la tabla o si hay celdas que debe verificar contra el PDF.
+    grid_pages = sum(1 for rp in recovered if rp.method == "rejilla")
+    warn_cells = sum(len(rp.suspicious or set()) for rp in recovered)
+
+    if progress_cb:
+        if warn_cells:
+            progress_cb(100, f"✅  {len(recovered)} tabla(s)  —  "
+                              f"{warn_cells} celda(s) marcada(s) para revisar")
+        else:
+            progress_cb(100, f"✅  {len(recovered)} tabla(s) recuperadas sin dudas")
+
     return {
-        "recovered": len(recovered),
-        "xlsx": xlsx,
-        "csvs": csvs,
-        "msg":  "ok",
+        "recovered":   len(recovered),
+        "xlsx":        xlsx,
+        "csvs":        csvs,
+        "msg":         "ok",
+        "grid_pages":  grid_pages,
+        "band_pages":  len(recovered) - grid_pages,
+        "warn_cells":  warn_cells,
     }
 
 
@@ -1265,7 +2184,7 @@ if _TKINTER_OK:
             hdr.pack(fill="x")
             Label(hdr, text="FASE 2", font=("Segoe UI", 13, "bold"),
                   bg=C_BG, fg=C_GOLD).pack(side="left", padx=(20, 6))
-            Label(hdr, text="Descomponer PDF en PowerPoint editable",
+            Label(hdr, text="Descomponer PDF — PowerPoint o Word editable",
                   font=("Segoe UI", 12), bg=C_BG, fg=C_TEXT).pack(side="left")
 
             Frame(self, bg=C_BORDER, height=1).pack(fill="x", padx=18)
@@ -1273,11 +2192,12 @@ if _TKINTER_OK:
             # Info box
             ib = Frame(self, bg=C_CARD2, padx=16, pady=10)
             ib.pack(fill="x", padx=20, pady=(14, 0))
-            Label(ib, text="PDF  →  PPTX  (una diapositiva por página)",
+            Label(ib, text="PDF  →  PPTX  (layout visual)      PDF  →  Word  (texto corrido)",
                   font=("Segoe UI", 10, "bold"),
                   bg=C_CARD2, fg=C_ACCENT).pack(anchor="w")
             Label(ib,
-                  text="• Modo fondo fiel: imagen completa de página + texto editable\n"
+                  text="• Word: texto corrido editable; Word reacomoda el flujo al editar\n"
+                       "• Modo fondo fiel: imagen completa de página + texto editable\n"
                        "• Modo objetos: sin imagen base, con fotos/tablas/gráficos como objetos independientes\n"
                        "• Texto en párrafos: una caja editable por bloque, con ancho correlacionado al original\n"
                        "• Reordena, elimina o agrega páginas en PowerPoint",
@@ -1294,6 +2214,21 @@ if _TKINTER_OK:
             # Opciones
             opt = Frame(self, bg=C_PANEL)
             opt.pack(fill="x", padx=22, pady=(8, 0))
+
+            # Formato de salida.
+            # PPTX: corregir presentaciones conservando el layout visual.
+            # DOCX: documentos de texto para reescribir; Word reacomoda el flujo.
+            fmt_row = Frame(opt, bg=C_PANEL)
+            fmt_row.pack(anchor="w", pady=(0, 6))
+            Label(fmt_row, text="Formato de salida:",
+                  bg=C_PANEL, fg=C_TEXT, font=("Segoe UI", 9, "bold")).pack(side="left")
+            self.output_format_var = StringVar(value="pptx")
+            for value, label in [("pptx", "PowerPoint (layout visual) \u2713"),
+                                 ("docx", "Word (texto corrido)")]:
+                ttk.Radiobutton(fmt_row, text=label,
+                                 variable=self.output_format_var,
+                                 value=value,
+                                 command=self._on_format_change).pack(side="left", padx=5)
 
             # DPI
             dpi_row = Frame(opt, bg=C_PANEL)
@@ -1335,7 +2270,7 @@ if _TKINTER_OK:
             comp_row.pack(anchor="w", pady=(6, 0))
             Label(comp_row, text="Composición:",
                   bg=C_PANEL, fg=C_TEXT, font=("Segoe UI", 9)).pack(side="left")
-            self.composition_var = StringVar(value="background")
+            self.composition_var = StringVar(value="objects")
             for value, label in [("background", "Fondo fiel"),
                                  ("objects", "Objetos independientes EXP")]:
                 ttk.Radiobutton(comp_row, text=label,
@@ -1351,6 +2286,21 @@ if _TKINTER_OK:
                              text="Mantener saltos visuales dentro del párrafo",
                              variable=self.line_breaks_var,
                              onvalue="1", offvalue="0").pack(side="left")
+
+            # v3.5: opción exclusiva de la salida Word.
+            # Inserta las imágenes del PDF intercaladas en el texto corrido.
+            img_row = Frame(opt, bg=C_PANEL)
+            img_row.pack(anchor="w", pady=(6, 0))
+            self.word_images_var = StringVar(value="1")
+            ttk.Checkbutton(img_row,
+                             text="Incluir imágenes del PDF en el documento Word",
+                             variable=self.word_images_var,
+                             onvalue="1", offvalue="0").pack(side="left")
+
+            # Filas que solo aplican a una de las dos salidas.
+            self._pptx_only_rows = [txt_row, mode_row, comp_row, br_row]
+            self._docx_only_rows = [img_row]
+            self._on_format_change()
 
             # Drop zone
             self.drop = DropZone(self, [".pdf"], "PDF a descomponer")
@@ -1382,10 +2332,31 @@ if _TKINTER_OK:
                    cursor="hand2",
                    command=lambda: _open_folder(Path(self._out))).pack()
 
+        def _set_rows_state(self, rows, enabled: bool):
+            """Habilita o deshabilita todos los controles de un grupo de filas."""
+            state = "normal" if enabled else "disabled"
+            for row in rows:
+                for child in row.winfo_children():
+                    try:
+                        child.configure(state=state)
+                    except Exception:
+                        pass
+
+        def _on_format_change(self):
+            """Muestra solo las opciones relevantes al formato de salida elegido."""
+            is_word = self.output_format_var.get() == "docx"
+            self._set_rows_state(self._pptx_only_rows, not is_word)
+            self._set_rows_state(self._docx_only_rows, is_word)
+
         def _run(self):
             src = self.drop.get()
             if not src:
                 messagebox.showwarning("Sin archivo", "Selecciona un PDF primero.")
+                return
+
+            # ── Salida Word: texto corrido editable ──────────────────────────
+            if self.output_format_var.get() == "docx":
+                self._run_word(src)
                 return
 
             composition_mode = self.composition_var.get()
@@ -1422,7 +2393,7 @@ if _TKINTER_OK:
                         base = "objetos independientes"
                     else:
                         base = "fondo fiel"
-
+                        #base = "objetos independientes"
                     if include_text and text_mode == "paragraphs":
                         txt = "párrafos editables"
                     elif include_text:
@@ -1432,6 +2403,41 @@ if _TKINTER_OK:
 
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"✅  {Path(dst).name}  ({base} + {txt})", fg=C_GREEN))
+                except Exception as e:
+                    self.after(0, lambda: self.lbl_res.config(
+                        text=f"❌  {e}", fg=C_WARN))
+                    self.after(0, lambda: self.status.set_status(0, "Error"))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _run_word(self, src: str):
+            """Conversión PDF → Word (texto corrido editable)."""
+            dst = filedialog.asksaveasfilename(
+                title="Guardar Word como…",
+                initialfile=Path(src).stem + "_editable.docx",
+                defaultextension=".docx",
+                filetypes=[("Word", "*.docx")])
+            if not dst:
+                return
+
+            self._out       = dst
+            include_images  = self.word_images_var.get() == "1"
+            image_dpi       = int(self.dpi_var.get())
+            self.lbl_res.config(text="")
+
+            def run():
+                try:
+                    fase2_word_convert(
+                        src, dst,
+                        include_images=include_images,
+                        image_dpi=image_dpi,
+                        progress_cb=lambda p, m: self.after(
+                            0, lambda p=p, m=m: self.status.set_status(p, m)))
+
+                    extra = "texto + imágenes" if include_images else "solo texto"
+                    self.after(0, lambda: self.lbl_res.config(
+                        text=f"✅  {Path(dst).name}  (Word editable — {extra})",
+                        fg=C_GREEN))
                 except Exception as e:
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"❌  {e}", fg=C_WARN))
@@ -1495,7 +2501,7 @@ if _TKINTER_OK:
             Label(titles, text="PDF Quick Disassembler",
                   font=("Segoe UI", 18, "bold"),
                   bg=C_BG, fg=C_TEXT).pack(anchor="w")
-            Label(titles, text="by  GoTopo  •  v3.4 Tabla Excel  •  2026 R.Montagne",
+            Label(titles, text="by  GoTopo  •  v3.6 Tablas Fieles  •  2026 R.Montagne",
                   font=("Segoe UI", 9),
                   bg=C_BG, fg=C_GOLD).pack(anchor="w")
             Label(titles,
@@ -1511,14 +2517,14 @@ if _TKINTER_OK:
             nb.pack(fill="both", expand=True, pady=0)
             nb.add(Fase1Tab(nb),       text="   📄  FASE 1  —  a PDF   ")
             nb.add(Fase2Tab(nb),       text="   🔓  FASE 2  —  a PowerPoint   ")
-            nb.add(TablaExcelTab(nb),  text="   📊  PDF Table Recovery   ")
+            nb.add(TablaExcelTab(nb),  text="   📊  FASE 3  —  Excel Table Recovery   ")
 
             # ── Footer ────────────────────────────────────────────────────────────
             Frame(self, bg=C_GOLD, height=1).pack(fill="x")
             footer = Frame(self, bg=C_BG, pady=6)
             footer.pack(fill="x")
             Label(footer,
-                  text="GoTopo  •  Democratizando el acceso a la justicia  •  Costa Rica",
+                  text="GoTopo  •  r.montagne  •  Costa Rica",
                   font=("Segoe UI", 8), bg=C_BG, fg=C_MUTED).pack()
 
 
@@ -1538,9 +2544,9 @@ if _TKINTER_OK:
             # Header
             hdr = Frame(self, bg=C_BG, pady=10)
             hdr.pack(fill="x")
-            Label(hdr, text="PDF Table Recovery", font=("Segoe UI", 13, "bold"),
+            Label(hdr, text="FASE 3", font=("Segoe UI", 13, "bold"),
                   bg=C_BG, fg=C_GOLD).pack(side="left", padx=(20, 6))
-            Label(hdr, text="Recuperar tablas financieras desde PDF",
+            Label(hdr, text="Excel Table Recovery — recuperar tablas desde PDF",
                   font=("Segoe UI", 12), bg=C_BG, fg=C_TEXT).pack(side="left")
 
             Frame(self, bg=C_BORDER, height=1).pack(fill="x", padx=18)
@@ -1675,12 +2681,31 @@ if _TKINTER_OK:
                             fg=C_WARN))
                         return
 
-                    n    = result["recovered"]
-                    xlsx = result["xlsx"]
-                    msg  = f"✅  {n} tabla(s) recuperada(s)  →  {out_dir.name}  (Desktop)"
+                    n     = result["recovered"]
+                    xlsx  = result["xlsx"]
+                    warns = result.get("warn_cells", 0)
+                    bands = result.get("band_pages", 0)
+
+                    metodo = ("rejilla del PDF" if not bands
+                              else f"{result.get('grid_pages', 0)} por rejilla, "
+                                   f"{bands} estimada(s)")
+                    msg = (f"✅  {n} tabla(s) — {metodo}  →  "
+                           f"{out_dir.name}  (Desktop)")
                     if xlsx:
                         msg += f"\n📊  {xlsx.name}"
-                    self.after(0, lambda: self.lbl_res.config(text=msg, fg=C_GREEN))
+
+                    # El aviso de celdas dudosas va en ámbar: un dato mal
+                    # recuperado que pase inadvertido invalida la tabla entera.
+                    if warns:
+                        msg += (f"\n⚠️  {warns} celda(s) marcada(s) en ámbar en el "
+                                f"Excel. Verifíquelas contra el PDF.")
+                        color = C_GOLD
+                    else:
+                        msg += "\n✓  Sin celdas dudosas detectadas."
+                        color = C_GREEN
+
+                    self.after(0, lambda m=msg, c=color:
+                                self.lbl_res.config(text=m, fg=c))
 
                 except Exception as e:
                     self.after(0, lambda: self.lbl_res.config(

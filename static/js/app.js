@@ -94,11 +94,12 @@ function setupRun(btnId, progWrapId, fillId, msgId, resultId, getFile, buildForm
     fill.style.width       = "2%";
     document.getElementById(msgId).textContent = "Subiendo archivo…";
 
-    const fd = buildForm(file);
+    const fd  = buildForm(file);
+    const url = (typeof endpoint === "function") ? endpoint() : endpoint;
     let jobId;
 
     try {
-      const res  = await fetch(endpoint, { method: "POST", body: fd });
+      const res  = await fetch(url, { method: "POST", body: fd });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || "Error del servidor");
       jobId = data.job_id;
@@ -115,17 +116,36 @@ function setupRun(btnId, progWrapId, fillId, msgId, resultId, getFile, buildForm
         return;
       }
       // Detectar caso sin tablas
-      if (data.recovered === 0 && endpoint.includes("table")) {
+      const resolved = (typeof endpoint === "function") ? endpoint() : endpoint;
+      if (data.recovered === 0 && resolved.includes("table")) {
         showResult(resultEl, "warn",
           "⚠️ No se encontraron tablas compatibles.<br>" +
           "Verifica que la tabla haya sido copiada directamente desde Excel.");
         return;
       }
       // Resultado exitoso con descarga
-      const n   = data.recovered ? ` — ${data.recovered} tabla(s) recuperada(s)` : "";
-      const html =
-        `<div>✅ Proceso completado${n}</div>` +
-        `<a class="btn-download" href="/api/download/${jobId}">⬇️ Descargar archivo</a>`;
+      let html = "";
+
+      if (data.recovered) {
+        // En Fase 3 importa informar la calidad: un número mal recuperado que
+        // pase inadvertido invalida toda la tabla para el usuario.
+        const metodo = data.band_pages
+          ? `${data.grid_pages} por rejilla, ${data.band_pages} estimada(s)`
+          : "rejilla del PDF";
+        html += `<div>✅ ${data.recovered} tabla(s) recuperada(s) — ${metodo}</div>`;
+        if (data.warn_cells) {
+          html += `<div style="margin-top:6px;color:#C8A060">` +
+                  `⚠️ ${data.warn_cells} celda(s) marcada(s) en ámbar dentro del Excel. ` +
+                  `Verifíquelas contra el PDF antes de usar la tabla.</div>`;
+        } else {
+          html += `<div style="margin-top:6px;color:#00C896">` +
+                  `Sin celdas dudosas detectadas.</div>`;
+        }
+      } else {
+        html += `<div>✅ Proceso completado</div>`;
+      }
+
+      html += `<a class="btn-download" href="/api/download/${jobId}">⬇️ Descargar archivo</a>`;
       showResult(resultEl, "ok", html);
     });
   });
@@ -148,18 +168,53 @@ setupRun("run1", "prog1-wrap", "prog1-fill", "prog1-msg", "result1", getFile1,
 );
 
 // ── FASE 2 ────────────────────────────────────────────────────────────────────
+// El formato de salida decide el endpoint y los campos enviados.
+// PPTX conserva el layout visual; DOCX produce texto corrido que Word reacomoda.
+
+function currentOutputFormat() {
+  return document.querySelector('input[name="outfmt"]:checked')?.value || "pptx";
+}
+
+// Muestra solo las opciones que aplican al formato elegido y ajusta el botón.
+function syncFase2Options() {
+  const isWord      = currentOutputFormat() === "docx";
+  const pptxGroups  = ["group-text", "group-comp"];
+  const wordGroup   = document.getElementById("word-options");
+  const btn         = document.getElementById("run2");
+
+  pptxGroups.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = isWord ? "none" : "";
+  });
+  if (wordGroup) wordGroup.style.display = isWord ? "" : "none";
+  if (btn) btn.textContent = isWord ? "📝 Descomponer a Word"
+                                    : "🔓 Descomponer a PowerPoint";
+}
+
+document.querySelectorAll('input[name="outfmt"]').forEach(radio => {
+  radio.addEventListener("change", syncFase2Options);
+});
+syncFase2Options();
+
 setupRun("run2", "prog2-wrap", "prog2-fill", "prog2-msg", "result2", getFile2,
   file => {
     const fd = new FormData();
     fd.append("file", file);
+
+    if (currentOutputFormat() === "docx") {
+      fd.append("include_images", document.getElementById("include_images").checked ? "1" : "0");
+      fd.append("image_dpi",      document.querySelector('input[name="dpi"]:checked')?.value || "150");
+      return fd;
+    }
+
     fd.append("dpi",             document.querySelector('input[name="dpi"]:checked')?.value || "150");
     fd.append("include_text",    document.getElementById("include_text").checked ? "1" : "0");
     fd.append("text_mode",       document.querySelector('input[name="text_mode"]:checked')?.value || "paragraphs");
-    fd.append("composition_mode",document.querySelector('input[name="comp"]:checked')?.value || "background");
+    fd.append("composition_mode",document.querySelector('input[name="comp"]:checked')?.value || "objects");
     fd.append("preserve_line_breaks", document.getElementById("preserve_breaks").checked ? "1" : "0");
     return fd;
   },
-  "/api/fase2"
+  () => currentOutputFormat() === "docx" ? "/api/fase2_word" : "/api/fase2"
 );
 
 // ── PDF TABLE RECOVERY ────────────────────────────────────────────────────────
