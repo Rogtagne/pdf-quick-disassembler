@@ -6,6 +6,7 @@ FASE 1: DOCX / PPTX  →  PDF
 FASE 2: PDF  →  PPTX editable  (fondo fiel o modo objetos independientes)
         PDF  →  DOCX editable   (texto corrido que Word reacomoda)
 FASE 3: PDF con tablas de Excel  →  XLSX + CSV
+        (opcional en escritorio: tablas pegadas como imagen, con OCR — ver ocr_tablas.py)
 """
 
 import os
@@ -27,7 +28,7 @@ _WEB_MODE = (os.environ.get("PQD_WEB_MODE") == "1"
 if not _WEB_MODE:
     try:
         from tkinter import (
-            Tk, ttk, StringVar, Label, Button, Frame,
+            Tk, ttk, StringVar, BooleanVar, Label, Button, Frame,
             filedialog, messagebox
         )
         from tkinter.ttk import Progressbar, Notebook
@@ -1109,9 +1110,18 @@ class _RecoveredPage:
     height: float
     word_count: int
     rows: List[List[str]]
-    method: str = "bandas"          # "rejilla" o "bandas"
+    method: str = "bandas"          # "rejilla", "bandas" u "ocr"
     suspicious: set = None          # coordenadas (fila, col) dudosas
     audit: dict = None              # conteo por tipo de sospecha
+    notes: dict = None              # (fila, col) → motivo, para el comentario de la celda
+    source: str = ""                # OCR: imagen y lector que produjeron la tabla
+
+
+_METHOD_LABELS = {
+    "rejilla": "Rejilla del PDF (fiel)",
+    "bandas":  "Bandas de texto (estimado)",
+    "ocr":     "OCR de imagen (verificar)",
+}
 
 
 def _parse_crop(value: Optional[str]):
@@ -1801,10 +1811,23 @@ def _recover_page_table(page, page_number: int, min_words: int,
     )
 
 
+def _table_names(pages: List[_RecoveredPage]) -> List[str]:
+    """Nombre único por tabla: una página puede dar varias (texto + imágenes)."""
+    names, used = [], set()
+    for rp in pages:
+        base = f"Pagina_{rp.page_number}" + ("_OCR" if rp.method == "ocr" else "")
+        name, k = base, 2
+        while name in used:
+            name, k = f"{base}_{k}", k + 1
+        used.add(name)
+        names.append(name)
+    return names
+
+
 def _export_csv_tables(pages: List[_RecoveredPage], out_dir: Path) -> List[Path]:
     out_paths = []
-    for rp in pages:
-        path = out_dir / f"pagina_{rp.page_number:03d}_tabla.csv"
+    for rp, name in zip(pages, _table_names(pages)):
+        path = out_dir / f"{name.lower()}_tabla.csv"
         with path.open("w", encoding="utf-8-sig", newline="") as f:
             csv.writer(f).writerows(rp.rows)
         out_paths.append(path)
@@ -1834,29 +1857,40 @@ def _export_xlsx_tables(pages: List[_RecoveredPage], out_path: Path) -> Optional
     warn_fill    = PatternFill("solid", fgColor="FFE4B5")   # ámbar: revisar
     grid_fill    = PatternFill("solid", fgColor="E8F5EE")   # verde: rejilla
     band_fill    = PatternFill("solid", fgColor="FFF4E0")   # crema: bandas
+    ocr_fill     = PatternFill("solid", fgColor="EDE7F6")   # lila: OCR de imagen
+    method_fill  = {"rejilla": grid_fill, "bandas": band_fill, "ocr": ocr_fill}
 
     if pages and wb.active:
         wb.remove(wb.active)
 
     total_warn = 0
 
-    for rp in pages:
-        ws_name = _re.sub(r"[\\/*?:\[\]]", "_", f"Pagina_{rp.page_number}")[:31]
-        ws = wb.create_sheet(ws_name)
+    for rp, ws_name in zip(pages, _table_names(pages)):
+        ws = wb.create_sheet(_re.sub(r"[\\/*?:\[\]]", "_", ws_name)[:31])
 
         suspicious = rp.suspicious or set()
         audit      = rp.audit or {}
+        notes      = rp.notes or {}
         total_warn += len(suspicious)
 
         # ── Encabezado informativo ───────────────────────────────────────────
-        metodo_txt = ("Rejilla del PDF (fiel)" if rp.method == "rejilla"
-                      else "Bandas de texto (estimado)")
+        metodo_txt = _METHOD_LABELS.get(rp.method, rp.method)
+        if rp.source:
+            metodo_txt += f" — {rp.source}"
         ws.append([f"Página {rp.page_number}", f"Método: {metodo_txt}"])
         ws.cell(1, 1).font = Font(bold=True, size=12)
         ws.cell(1, 2).font = Font(bold=True)
-        ws.cell(1, 2).fill = grid_fill if rp.method == "rejilla" else band_fill
+        ws.cell(1, 2).fill = method_fill.get(rp.method, band_fill)
 
-        if suspicious:
+        if suspicious and rp.method == "ocr":
+            ws.append([
+                f"⚠ {len(suspicious)} celda(s) a revisar",
+                f"Totales que no cuadran: {audit.get('total', 0)}  |  "
+                f"Lectores OCR en desacuerdo: {audit.get('desacuerdo', 0)}",
+            ])
+            ws.cell(2, 1).font = Font(bold=True, color="B36B00")
+            ws.cell(2, 2).font = Font(color="B36B00")
+        elif suspicious:
             ws.append([
                 f"⚠ {len(suspicious)} celda(s) a revisar",
                 f"Posibles números partidos: {audit.get('fragmento', 0)}  |  "
@@ -1887,8 +1921,9 @@ def _export_xlsx_tables(pages: List[_RecoveredPage], out_path: Path) -> Optional
             cell.font = Font(bold=True, color="8B4500")
             try:
                 cell.comment = Comment(
-                    "Revisar: este valor puede estar incompleto o fusionado "
-                    "con otra columna. Compare contra el PDF original.",
+                    notes.get((r_idx, c_idx),
+                              "Revisar: este valor puede estar incompleto o fusionado "
+                              "con otra columna.") + " Compare contra el PDF original.",
                     "PDF Quick Disassembler",
                 )
             except Exception:
@@ -1920,22 +1955,88 @@ def _export_xlsx_tables(pages: List[_RecoveredPage], out_path: Path) -> Optional
     # ── Hoja resumen cuando hay varias páginas ───────────────────────────────
     if len(pages) > 1:
         summary = wb.create_sheet("Resumen", 0)
-        summary.append(["Página", "Método", "Filas", "Celdas a revisar"])
-        for c in range(1, 5):
+        summary.append(["Hoja", "Página", "Método", "Filas", "Celdas a revisar"])
+        for c in range(1, 6):
             summary.cell(1, c).font = Font(bold=True)
             summary.cell(1, c).fill = header_fill
-        for rp in pages:
+        for rp, name in zip(pages, _table_names(pages)):
             summary.append([
+                name,
                 rp.page_number,
-                "Rejilla del PDF" if rp.method == "rejilla" else "Bandas (estimado)",
+                _METHOD_LABELS.get(rp.method, rp.method),
                 len(rp.rows),
                 len(rp.suspicious or set()),
             ])
-        for col, width in zip("ABCD", (10, 22, 10, 18)):
+        for col, width in zip("ABCDE", (16, 10, 28, 10, 18)):
             summary.column_dimensions[col].width = width
 
     wb.save(out_path)
     return out_path
+
+
+# ── OCR de tablas en imágenes (opcional, solo escritorio) ─────────────────────
+# PaddleOCR necesita PaddlePaddle con GPU, que no cabe en el entorno de la app ni en
+# el servidor web. Por eso corre en su propio entorno (venv_ocr) como proceso aparte.
+
+def ocr_python() -> Optional[Path]:
+    """Python del entorno OCR, o None si no está instalado."""
+    env = os.environ.get("PQD_OCR_PYTHON")
+    candidates = [Path(env)] if env else []
+    base = Path(__file__).resolve().parent
+    candidates += [base / "venv_ocr" / "Scripts" / "python.exe",
+                   base / "venv_ocr" / "bin" / "python"]
+    return next((p for p in candidates if p.exists()), None)
+
+
+def _recover_image_tables_ocr(src_path: str, progress_cb=None) -> List[_RecoveredPage]:
+    """Lee con OCR las tablas pegadas como imagen (ver ocr_tablas.py)."""
+    import json
+
+    python = ocr_python()
+    if python is None:
+        raise RuntimeError("Entorno OCR (venv_ocr) no instalado")
+    script = Path(__file__).resolve().parent / "ocr_tablas.py"
+
+    with tempfile.TemporaryDirectory(prefix="pqd_ocr_") as tmp:
+        out_json = Path(tmp) / "tablas.json"
+        env = dict(os.environ, PYTHONIOENCODING="utf-8",
+                   PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="True")
+        proc = subprocess.Popen(
+            [str(python), "-u", str(script), src_path, "--json", str(out_json)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        tail = []
+        for line in proc.stdout:
+            if line.startswith("@@PROGRESO "):
+                _, pct, msg = line.rstrip("\n").split(" ", 2)
+                if progress_cb:
+                    progress_cb(int(pct), msg)
+            else:
+                tail = (tail + [line.rstrip()])[-40:]
+        if proc.wait() != 0 or not out_json.exists():
+            log.error("OCR de tablas falló (código %s):\n%s", proc.returncode, "\n".join(tail))
+            raise RuntimeError(f"El OCR falló (código {proc.returncode}); detalles en el log")
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+
+    pages = []
+    for t in data["tablas"]:
+        notes = {(r, c): motivo for r, c, motivo in t["dudosas"]}
+        pages.append(_RecoveredPage(
+            page_number=t["pagina"],
+            width=0.0,
+            height=0.0,
+            word_count=0,
+            rows=t["filas"],
+            method="ocr",
+            suspicious=set(notes),
+            audit={"total":      sum("total" in m for m in notes.values()),
+                   "desacuerdo": sum("lectores" in m for m in notes.values())},
+            notes=notes,
+            source=f"{t['imagen']}, {t['lector']}",
+        ))
+    log.debug("OCR: %d tabla(s) en imágenes de %s", len(pages), Path(src_path).name)
+    return pages
 
 
 def tabla_excel_recover(src_path: str, out_dir: Path,
@@ -1944,15 +2045,19 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
                          gap_tol: float = 18.0,
                          min_words: int = 80,
                          crop_str: Optional[str] = None,
+                         use_ocr: bool = False,
                          progress_cb=None) -> dict:
     """
     Orquestador de recuperación de tablas Excel desde PDF.
+    Con use_ocr también lee las tablas pegadas como imagen (requiere venv_ocr).
     Retorna dict con claves: recovered (int), xlsx (Path|None), csvs (list), msg (str)
     """
     import pdfplumber
 
     crop = _parse_crop(crop_str) if crop_str else None
     recovered: List[_RecoveredPage] = []
+    # Con OCR, el texto ocupa la primera parte de la barra y las imágenes el resto.
+    text_span = 30 if use_ocr else 75
 
     if progress_cb: progress_cb(5, "Abriendo PDF…")
 
@@ -1962,7 +2067,7 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
         if progress_cb: progress_cb(10, f"Analizando {n} páginas…")
 
         for i, page in enumerate(pdf.pages):
-            pct = 10 + int(75 * (i / max(n, 1)))
+            pct = 10 + int(text_span * (i / max(n, 1)))
             if progress_cb: progress_cb(pct, f"Escaneando página {i+1}/{n}…")
 
             rp = _recover_page_table(
@@ -1977,10 +2082,18 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
             if rp:
                 recovered.append(rp)
 
+    ocr_pages: List[_RecoveredPage] = []
+    if use_ocr:
+        def ocr_progress(p, m):
+            if progress_cb:
+                progress_cb(40 + int(p * 0.45), m)
+        ocr_pages = _recover_image_tables_ocr(src_path, progress_cb=ocr_progress)
+        recovered = sorted(recovered + ocr_pages, key=lambda rp: rp.page_number)
+
     if not recovered:
         if progress_cb: progress_cb(100, "⚠️  Sin tablas compatibles encontradas")
         return {"recovered": 0, "xlsx": None, "csvs": [], "msg": "sin_tablas",
-                "grid_pages": 0, "band_pages": 0, "warn_cells": 0}
+                "grid_pages": 0, "band_pages": 0, "ocr_pages": 0, "warn_cells": 0}
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1994,6 +2107,7 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
     # Resumen de calidad: al usuario le importa saber si puede confiar
     # en la tabla o si hay celdas que debe verificar contra el PDF.
     grid_pages = sum(1 for rp in recovered if rp.method == "rejilla")
+    band_pages = sum(1 for rp in recovered if rp.method == "bandas")
     warn_cells = sum(len(rp.suspicious or set()) for rp in recovered)
 
     if progress_cb:
@@ -2009,7 +2123,8 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
         "csvs":        csvs,
         "msg":         "ok",
         "grid_pages":  grid_pages,
-        "band_pages":  len(recovered) - grid_pages,
+        "band_pages":  band_pages,
+        "ocr_pages":   len(ocr_pages),
         "warn_cells":  warn_cells,
     }
 
@@ -2566,7 +2681,7 @@ if _TKINTER_OK:
     # ══════════════════════════════════════════════════════════════════════════════
 
     class TablaExcelTab(Frame):
-        """Pestaña para recuperar tablas financieras desde PDFs con texto embebido."""
+        """Pestaña para recuperar tablas financieras desde PDFs (texto embebido u OCR)."""
 
         def __init__(self, parent, **kw):
             super().__init__(parent, bg=C_PANEL, **kw)
@@ -2589,13 +2704,13 @@ if _TKINTER_OK:
             warn_frame.pack(fill="x", padx=20, pady=(14, 0))
 
             Label(warn_frame,
-                  text="⚠️  SOLO para tablas copiadas directamente desde Excel",
+                  text="⚠️  Resultado fiel: tablas copiadas directamente desde Excel",
                   font=("Segoe UI", 10, "bold"),
                   bg="#2A1E0A", fg=C_GOLD, justify="left").pack(anchor="w")
             Label(warn_frame,
                   text="Funciona cuando en Excel se seleccionó el rango → Copy → Paste en PowerPoint\n"
                        "→ se convirtió a PDF con LibreOffice o PDF Quick Disassembler.\n"
-                       "NO funciona con tablas guardadas como PNG, JPG o captura de pantalla.",
+                       "Tablas pegadas como imagen o captura: active «Leer tablas en imágenes (OCR)».",
                   font=("Segoe UI", 8), bg="#2A1E0A", fg="#C8A060",
                   justify="left").pack(anchor="w", pady=(4, 0))
 
@@ -2643,6 +2758,19 @@ if _TKINTER_OK:
             for v, l in [("12", "12pt"), ("16", "16pt ✓"), ("22", "22pt")]:
                 ttk.Radiobutton(row2, text=l,
                                  variable=self.font_var, value=v).pack(side="left", padx=4)
+
+            # OCR: solo disponible si el entorno venv_ocr (PaddleOCR + GPU) está instalado.
+            row3 = Frame(adv_frame, bg=C_PANEL)
+            row3.pack(anchor="w", pady=(4, 0))
+            ocr_ok = ocr_python() is not None
+            self.ocr_var = BooleanVar(value=False)
+            ttk.Checkbutton(row3, text="Leer también tablas en imágenes (OCR)",
+                            variable=self.ocr_var,
+                            state="normal" if ocr_ok else "disabled").pack(side="left")
+            Label(row3,
+                  text=("  más lento (~10–60 s por imagen); revise las celdas en ámbar"
+                        if ocr_ok else "  no disponible: falta el entorno venv_ocr"),
+                  bg=C_PANEL, fg=C_MUTED, font=("Segoe UI", 8)).pack(side="left")
 
             # ── Drop zone ─────────────────────────────────────────────────────────
             self.drop = DropZone(self, [".pdf"], "PDF con tablas de Excel")
@@ -2696,6 +2824,7 @@ if _TKINTER_OK:
 
             gap_tol      = float(self.gap_var.get())
             max_font_size = float(self.font_var.get())
+            use_ocr      = self.ocr_var.get()
 
             def run():
                 try:
@@ -2704,13 +2833,17 @@ if _TKINTER_OK:
                         out_dir=out_dir,
                         gap_tol=gap_tol,
                         max_font_size=max_font_size,
+                        use_ocr=use_ocr,
                         progress_cb=lambda p, m: self.after(
                             0, lambda p=p, m=m: self.status.set_status(p, m)),
                     )
                     if result["msg"] == "sin_tablas":
+                        hint = ("" if use_ocr else
+                                "\nSi la tabla es una imagen, active «Leer tablas en imágenes (OCR)».")
                         self.after(0, lambda: self.lbl_res.config(
                             text="⚠️  No se encontraron tablas compatibles.\n"
-                                 "Verifica que la tabla haya sido copiada directamente desde Excel.",
+                                 "Verifica que la tabla haya sido copiada directamente desde Excel."
+                                 + hint,
                             fg=C_WARN))
                         return
 
@@ -2718,10 +2851,14 @@ if _TKINTER_OK:
                     xlsx  = result["xlsx"]
                     warns = result.get("warn_cells", 0)
                     bands = result.get("band_pages", 0)
+                    ocrs  = result.get("ocr_pages", 0)
 
-                    metodo = ("rejilla del PDF" if not bands
-                              else f"{result.get('grid_pages', 0)} por rejilla, "
-                                   f"{bands} estimada(s)")
+                    partes = [f"{result.get('grid_pages', 0)} por rejilla"]
+                    if bands:
+                        partes.append(f"{bands} estimada(s)")
+                    if ocrs:
+                        partes.append(f"{ocrs} por OCR de imagen")
+                    metodo = ("rejilla del PDF" if len(partes) == 1 else ", ".join(partes))
                     msg = (f"✅  {n} tabla(s) — {metodo}  →  "
                            f"{out_dir.name}  (Desktop)")
                     if xlsx:

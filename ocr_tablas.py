@@ -1,26 +1,32 @@
-"""Prototipo híbrido: OCR solo donde el PDF no tiene texto digital, con dos lectores.
+"""OCR de tablas pegadas como imagen dentro de un PDF, con dos lectores.
 
-Por cada página:
-  - Las tablas con texto digital quedan para el Table Recovery actual (exacto, sin OCR).
+Lo usa la Fase 3 (Excel Table Recovery) de la app de escritorio para las tablas que no
+tienen texto digital. Corre en su propio entorno (venv_ocr, con PaddlePaddle GPU) como
+proceso aparte, para que la app y la versión web no dependan de PaddleOCR.
+
   - Cada imagen incrustada grande se recorta a alta resolución y se pasa por PaddleOCR-VL,
     que encuentra las tablas y su estructura.
   - Cada tabla se vuelve a leer con OCR clásico (PP-OCRv5) y se arma por coordenadas:
     cada número es una caja real en la imagen, así que no puede "repetir" valores.
-  - Se elige la lectura que mejor cuadra con la columna "Total"; en el Excel se marcan en
-    ámbar las celdas cuyo total no cuadra y las celdas donde los dos lectores no coinciden.
+  - Se elige la lectura que mejor cuadra con la columna "Total" y se señalan las celdas
+    cuyo total no cuadra o donde los dos lectores no coinciden.
 
 Uso (con venv_ocr):
-    venv_ocr\\Scripts\\python.exe pruebas_ocr\\hibrido_ocr.py PDF [PDF ...] [--min-area 0.15] [--dpi 200]
+    venv_ocr\\Scripts\\python.exe ocr_tablas.py PDF --json SALIDA.json [--min-area 0.15] [--dpi 200]
+
+Escribe el avance en stdout como líneas "@@PROGRESO <0-100> <mensaje>" y el resultado en
+SALIDA.json: {"tablas": [{"pagina", "imagen", "lector", "filas", "dudosas": [[f, c, motivo]]}]}.
 """
 import argparse
+import json
 import re
-import time
+import sys
+import tempfile
 from io import StringIO
 from pathlib import Path
 
 import fitz  # PyMuPDF
 
-AMBAR = "FFC000"
 NUM_RE = re.compile(r"^\(?-?\s*[\d\s.,]+\)?$")
 # El OCR lee el signo menos como raya, guion largo o incluso el carácter chino "一".
 GUIONES = str.maketrans({c: "-" for c in "–—−‐‑一"})
@@ -246,38 +252,6 @@ def discrepancias(final, otra):
     return dudosas
 
 
-def exportar_excel(tablas, destino: Path):
-    """tablas: [(pagina, png, lector, df, {(fila, col): motivo})]."""
-    from openpyxl import Workbook
-    from openpyxl.comments import Comment
-    from openpyxl.styles import Font, PatternFill
-
-    wb = Workbook()
-    resumen = wb.active
-    resumen.title = "Resumen"
-    resumen.append(["Hoja", "Página", "Imagen", "Lector usado", "Filas", "Columnas", "Celdas dudosas"])
-    for c in resumen[1]:
-        c.font = Font(bold=True)
-    fill = PatternFill("solid", fgColor=AMBAR)
-
-    for n, (pagina, png, lector, df, dudosas) in enumerate(tablas, 1):
-        ws = wb.create_sheet(f"T{n:02d}_p{pagina}")
-        for r in range(len(df)):
-            fila = []
-            for c in range(df.shape[1]):
-                v = df.iat[r, c]
-                v = "" if str(v) == "nan" else v
-                num = a_numero(v)
-                fila.append(num if num is not None and r > 0 else v)
-            ws.append(fila)
-        for (r, c), motivo in dudosas.items():
-            celda = ws.cell(row=r + 1, column=c + 1)
-            celda.fill = fill
-            celda.comment = Comment(motivo, "OCR")
-        resumen.append([ws.title, pagina, png.name, lector, len(df), df.shape[1], len(dudosas)])
-    wb.save(destino)
-
-
 def leer_tabla(ocr, imagen, bloque, html_df):
     """Combina la lectura de PaddleOCR-VL con la de PP-OCRv5 por coordenadas.
 
@@ -304,16 +278,25 @@ def leer_tabla(ocr, imagen, bloque, html_df):
         otra = html_df if df is coord else coord
         for r, c in discrepancias(df, otra):
             if r not in cuadran:                      # si la fila cuadra, el total la confirma
-                dudosas[(r, c)] = "Los dos lectores de OCR no coinciden en esta celda"
+                dudosas[(r, c)] = "Los dos lectores de OCR no coinciden en esta celda."
     for rc in malas:
-        dudosas[rc] = "El total no coincide con la suma de la fila"
+        dudosas[rc] = "El total no coincide con la suma de la fila."
     return lector, df, dudosas
+
+
+def progreso(pct: int, mensaje: str):
+    print(f"@@PROGRESO {pct} {mensaje}", flush=True)
+
+
+def celda_texto(v) -> str:
+    return "" if str(v) == "nan" else str(v).strip()
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("pdfs", nargs="+")
+    ap.add_argument("pdf")
+    ap.add_argument("--json", required=True, help="Archivo de salida con las tablas")
     ap.add_argument("--min-area", type=float, default=0.15,
                     help="Fracción mínima de la página que debe ocupar una imagen (0.15)")
     ap.add_argument("--dpi", type=int, default=200)
@@ -321,21 +304,20 @@ def main():
 
     import numpy as np
     from PIL import Image
-    from paddleocr import PaddleOCR, PaddleOCRVL
-    vl = PaddleOCRVL(device="gpu:0")
-    ocr = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False,
-                    use_textline_orientation=False, device="gpu:0")
 
-    for pdf in map(Path, args.pdfs):
-        out = Path(__file__).parent / "resultados_hibrido" / pdf.stem.strip()
-        (out / "recortes").mkdir(parents=True, exist_ok=True)
-        recortes = recortar_imagenes(pdf, out / "recortes", args.min_area, args.dpi)
-        print(f"\n== {pdf.name}: {len(recortes)} imágenes a leer")
-
+    with tempfile.TemporaryDirectory(prefix="ocr_tablas_") as tmp:
+        recortes = recortar_imagenes(Path(args.pdf), Path(tmp), args.min_area, args.dpi)
         tablas = []
-        t0 = time.perf_counter()
-        for pagina, n_palabras, png in recortes:
-            t1 = time.perf_counter()
+        if recortes:
+            progreso(2, f"{len(recortes)} imagen(es) grandes; cargando modelos OCR…")
+            from paddleocr import PaddleOCR, PaddleOCRVL
+            vl = PaddleOCRVL(device="gpu:0")
+            ocr = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False,
+                            use_textline_orientation=False, device="gpu:0")
+
+        for i, (pagina, _n_palabras, png) in enumerate(recortes):
+            progreso(5 + int(95 * i / len(recortes)),
+                     f"OCR imagen {i + 1}/{len(recortes)} (página {pagina})…")
             imagen = np.array(Image.open(png).convert("RGB"))
             for res in vl.predict(str(png)):
                 for b in res.json["res"]["parsing_res_list"]:
@@ -345,21 +327,18 @@ def main():
                     if not dfs:
                         continue
                     lector, df, dudosas = leer_tabla(ocr, imagen, b, max(dfs, key=len))
-                    tablas.append((pagina, png, lector, df, dudosas))
-            print(f"  p{pagina:>2} {png.name}: {time.perf_counter() - t1:5.1f} s "
-                  f"(texto digital en la página: {n_palabras} palabras)")
+                    tablas.append({
+                        "pagina": pagina,
+                        "imagen": png.name,
+                        "lector": lector,
+                        "filas": [[celda_texto(v) for v in fila] for fila in df.values.tolist()],
+                        "dudosas": [[r, c, motivo] for (r, c), motivo in dudosas.items()],
+                    })
 
-        destino = out / f"{pdf.stem.strip()}_tablas_ocr.xlsx"
-        if tablas:
-            exportar_excel(tablas, destino)
-        total = time.perf_counter() - t0
-        dud = sum(len(t[4]) for t in tablas)
-        print(f"  → {len(tablas)} tablas, {dud} celdas dudosas, {total:.0f} s en total")
-        for pagina, png, lector, df, dudosas in tablas:
-            print(f"     p{pagina:>2} {png.name}: {lector}, {df.shape}, {len(dudosas)} dudosas")
-        if tablas:
-            print(f"  → {destino}")
+    Path(args.json).write_text(json.dumps({"tablas": tablas}, ensure_ascii=False),
+                               encoding="utf-8")
+    progreso(100, f"{len(tablas)} tabla(s) leídas por OCR")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

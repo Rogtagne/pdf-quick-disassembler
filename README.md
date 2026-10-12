@@ -44,6 +44,20 @@ Nuevo PDF listo
 pip install pypdf python-pptx python-docx pdf2image Pillow reportlab pdfplumber
 ```
 
+### OCR de tablas en imágenes (opcional, solo escritorio)
+
+La Fase 3 puede leer tablas pegadas como imagen con la opción
+«Leer también tablas en imágenes (OCR)». Usa PaddleOCR-VL y PP-OCRv5 en GPU NVIDIA,
+instalados en un entorno aparte (`venv_ocr`) para no cargar la app ni la versión web:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_ocr.ps1   # crea venv_ocr; reintenta si se corta la red
+```
+
+Si `venv_ocr` no existe la opción aparece desactivada. Otra ubicación: variable
+`PQD_OCR_PYTHON` con la ruta al `python.exe` del entorno OCR. La primera ejecución
+descarga los modelos (~2 GB).
+
 ### Ejecutar
 
 ```bash
