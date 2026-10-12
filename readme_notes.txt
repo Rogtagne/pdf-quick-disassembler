@@ -98,3 +98,30 @@ Cada vez que hagas `git push`, Render redespliega automáticamente. No hay que h
  
 Para borrar todas las carpetas __pycache__ de forma recursiva desde la raíz de tu proyecto, puedes usar una combinación de comandos de PowerShell.
 Get-ChildItem -Path . -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object {$_.Name -eq '__pycache__'} | Remove-Item -Recurse -Force
+
+
+
+claude code start here  09/10/2026
+La mejor opción hoy (octubre 2026) es PaddleOCR-VL-1.6, y conviene usar GLM-OCR como segundo lector para verificar. Para tablas en imágenes, los modelos pequeños
+  especializados en documentos superan a los modelos de visión grandes, y además son mucho más rápidos.
+
+  1. Principal: PaddleOCR-VL-1.6
+  - Versión y licencia: salió el 28 de mayo de 2026. Tiene ~0.9B parámetros y licencia Apache-2.0, así que puedes usarlo libremente, incluso en tu app web.
+  - Precisión: ocupa el 1er lugar en OmniDocBench v1.6, el benchmark de referencia de lectura de documentos, con 96.3 %. Las notas de la versión destacan una mejora fuerte
+    en reconocimiento de tablas.
+  - Imágenes difíciles: también obtiene récord en Real5-OmniDocBench, que mide escaneos, fotos de pantalla, páginas torcidas o mal iluminadas. Ese es justo tu caso.
+  - Página completa: su flujo completo detecta solo dónde está la tabla en la página y luego la lee. No hay que recortarla a mano.
+  - En tu equipo: usa unos pocos GB de VRAM, así que en la RTX 5090 debería procesar varias páginas por segundo.
+
+  2. Verificador: GLM-OCR
+  - Tamaño: también ~0.9B.
+  - Precisión en tablas: en su propio paper tiene las mejores cifras publicadas en tablas: 93.96 de precisión de estructura, contra 92.76 de PaddleOCR-VL-1.5. En un
+    benchmark de tablas reales saca 91.5 contra 86.1.
+  - Ojo: son cifras del propio autor, y se compararon con la versión 1.5, no con la 1.6.
+  - Cómo usarlos juntos: si los dos modelos leen la misma celda distinto, esa celda se marca en ámbar en el Excel. Es la misma idea que ya usa tu Fase 3, pero ahora
+    detecta también los dígitos mal leídos. Los dos modelos caben en la GPU al mismo tiempo.
+
+  Opcional: Qwen3-VL (8B o 32B) en Ollama. Solo lo usaría para imágenes muy raras donde fallen los otros dos. Los modelos de visión generales son más lentos y más
+  propensos a inventar dígitos.
+
+  Descartado para tu caso: MinerU2.5-Pro. Es muy bueno, pero su licencia AGPL-3.0 te complicaría porque tu app está publicada en la web.

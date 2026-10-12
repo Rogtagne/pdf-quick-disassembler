@@ -65,6 +65,10 @@ def _setup_poppler():
     return None
 
 POPPLER_PATH = _setup_poppler()
+if POPPLER_PATH:
+    log.debug("Poppler encontrado en %s", POPPLER_PATH)
+else:
+    log.warning("Poppler no encontrado: el renderizado de páginas (pdf2image) fallará")
 
 # ── Paleta de colores ─────────────────────────────────────────────────────────
 C_BG      = "#12172B"   # fondo profundo
@@ -95,8 +99,12 @@ def _libre_convert(src: Path, dst_dir: Path) -> Path:
                 capture_output=True, timeout=120)
             out = dst_dir / (src.stem + ".pdf")
             if r.returncode == 0 and out.exists():
+                log.debug("LibreOffice (%s) convirtió %s", soffice, src.name)
                 return out
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+            log.debug("LibreOffice (%s) falló: código=%s stderr=%s", soffice,
+                      r.returncode, r.stderr.decode(errors="replace").strip()[-300:])
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.debug("LibreOffice (%s) no disponible: %s", soffice, type(e).__name__)
             continue
     raise RuntimeError("LibreOffice no encontrado")
 
@@ -170,8 +178,9 @@ def fase1_convert(src_path: str, dst_path: str, progress_cb=None) -> bool:
             shutil.copy2(_libre_convert(src, tmp), dst)
             if progress_cb: progress_cb(100, "✅  Conversión completada con LibreOffice")
             return True
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Fase 1: LibreOffice no disponible (%s); usando motor Python "
+                        "(solo texto) para %s", e, src.name)
         if progress_cb: progress_cb(50, "Motor Python (solo texto)…")
         if ext == ".docx":   _docx_to_pdf_python(src, dst)
         elif ext == ".pptx": _pptx_to_pdf_python(src, dst)
@@ -544,7 +553,8 @@ def _extract_pdf_image_regions(pdf_path: str, dpi: int = 150):
                 try:
                     pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=False)
                     png_bytes = pix.tobytes("png")
-                except Exception:
+                except Exception as e:
+                    log.debug("Página %d: imagen omitida (%s)", page_index + 1, e)
                     continue
 
                 page_regions.append(
@@ -651,6 +661,8 @@ def fase2_convert(src_path: str, dst_path: str, dpi: int = 150,
     src = Path(src_path)
     reader = PdfReader(str(src))
     n = len(reader.pages)
+    log.debug("Fase 2: %s — %d páginas, composición=%s, texto=%s (%s)",
+              src.name, n, composition_mode, include_text, text_mode)
 
     if progress_cb:
         progress_cb(5, "Leyendo PDF…")
@@ -662,6 +674,8 @@ def fase2_convert(src_path: str, dst_path: str, dpi: int = 150,
         try:
             text_pages = _extract_text_blocks(src_path, mode=text_mode)
         except Exception as e:
+            log.warning("Fase 2: extracción de texto omitida en %s: %s",
+                        src.name, e, exc_info=True)
             if progress_cb:
                 progress_cb(8, f"Extracción omitida: {e}")
 
@@ -674,6 +688,8 @@ def fase2_convert(src_path: str, dst_path: str, dpi: int = 150,
         try:
             image_regions = _extract_pdf_image_regions(src_path, dpi=dpi)
         except Exception as e:
+            log.warning("Fase 2: extracción de imágenes omitida en %s: %s",
+                        src.name, e, exc_info=True)
             image_regions = [[] for _ in range(n)]
             if progress_cb:
                 progress_cb(12, f"Extracción de imágenes omitida: {e}")
@@ -938,6 +954,8 @@ def fase2_word_convert(src_path: str, dst_path: str,
         raise RuntimeError("No se pudo leer texto del PDF")
 
     body_size = _estimate_body_size(text_pages)
+    log.debug("Fase 2 Word: %s — %d páginas, cuerpo ≈ %g pt",
+              src.name, len(text_pages), body_size)
 
     if progress_cb:
         progress_cb(18, f"Texto extraído (cuerpo ≈ {body_size:g} pt)")
@@ -949,7 +967,9 @@ def fase2_word_convert(src_path: str, dst_path: str,
             progress_cb(25, "Extrayendo imágenes…")
         try:
             image_pages = _extract_pdf_image_regions(str(src), dpi=image_dpi)
-        except Exception:
+        except Exception as e:
+            log.warning("Fase 2 Word: extracción de imágenes omitida en %s: %s",
+                        src.name, e, exc_info=True)
             image_pages = []
 
     doc = Document()
@@ -991,8 +1011,10 @@ def fase2_word_convert(src_path: str, dst_path: str,
                     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     para.add_run().add_picture(stream, width=Inches(width_in))
                     empty_doc = False
-                except Exception:
+                except Exception as e:
                     # Una imagen ilegible no debe abortar el documento completo.
+                    log.debug("Página %d: imagen no insertada en Word (%s)",
+                              page_index + 1, e)
                     continue
                 continue
 
@@ -1742,7 +1764,10 @@ def _recover_page_table(page, page_number: int, min_words: int,
             if grid_rows:
                 rows = grid_rows
                 method = "rejilla"
-        except Exception:
+        except Exception as e:
+            log.warning("Página %d: recuperación por rejilla falló (%s); usando bandas",
+                        page_number, e)
+            log.debug("Traceback de rejilla, página %d", page_number, exc_info=True)
             rows = None
 
     # ── Estrategia 2: bandas (respaldo) ──────────────────────────────────────
@@ -1757,9 +1782,12 @@ def _recover_page_table(page, page_number: int, min_words: int,
 
         table_like = sum(1 for r in rows if len(r) >= 2)
         if table_like < 5:
+            log.debug("Página %d: sin tabla (%d filas tabulares)", page_number, table_like)
             return None
 
     suspicious, audit = _audit_recovered_rows(rows)
+    log.debug("Página %d: tabla por %s — %d filas, %d celdas dudosas",
+              page_number, method, len(rows), len(suspicious or ()))
 
     return _RecoveredPage(
         page_number=page_number,
@@ -1796,7 +1824,8 @@ def _export_xlsx_tables(pages: List[_RecoveredPage], out_path: Path) -> Optional
         from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
         from openpyxl.comments import Comment
         from openpyxl.utils import get_column_letter
-    except Exception:
+    except Exception as e:
+        log.error("openpyxl no disponible (%s): no se generará el Excel", e)
         return None
 
     wb = Workbook()
@@ -1929,6 +1958,7 @@ def tabla_excel_recover(src_path: str, out_dir: Path,
 
     with pdfplumber.open(src_path) as pdf:
         n = len(pdf.pages)
+        log.debug("Table Recovery: %s — %d páginas", Path(src_path).name, n)
         if progress_cb: progress_cb(10, f"Analizando {n} páginas…")
 
         for i, page in enumerate(pdf.pages):
@@ -2161,6 +2191,7 @@ if _TKINTER_OK:
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"✅  {Path(dst).name}  guardado", fg=C_GREEN))
                 except Exception as e:
+                    log.exception("Fase 1 (escritorio) falló: %s", src)
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"❌  {e}", fg=C_WARN))
                     self.after(0, lambda: self.status.set_status(0, "Error"))
@@ -2404,6 +2435,7 @@ if _TKINTER_OK:
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"✅  {Path(dst).name}  ({base} + {txt})", fg=C_GREEN))
                 except Exception as e:
+                    log.exception("Fase 2 PPTX (escritorio) falló: %s", src)
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"❌  {e}", fg=C_WARN))
                     self.after(0, lambda: self.status.set_status(0, "Error"))
@@ -2439,6 +2471,7 @@ if _TKINTER_OK:
                         text=f"✅  {Path(dst).name}  (Word editable — {extra})",
                         fg=C_GREEN))
                 except Exception as e:
+                    log.exception("Fase 2 Word (escritorio) falló: %s", src)
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"❌  {e}", fg=C_WARN))
                     self.after(0, lambda: self.status.set_status(0, "Error"))
@@ -2708,6 +2741,7 @@ if _TKINTER_OK:
                                 self.lbl_res.config(text=m, fg=c))
 
                 except Exception as e:
+                    log.exception("Table Recovery (escritorio) falló: %s", src)
                     self.after(0, lambda: self.lbl_res.config(
                         text=f"❌  Error: {e}", fg=C_WARN))
                     self.after(0, lambda: self.status.set_status(0, "Error"))
