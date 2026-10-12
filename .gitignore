@@ -40,3 +40,5 @@ desktop.ini
 ~$*
 
 pruebas_ocr/resultados/
+pruebas_ocr/resultados_hibrido/
+pruebas_ocr/log_*.txt

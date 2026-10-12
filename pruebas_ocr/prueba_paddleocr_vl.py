@@ -34,7 +34,7 @@ def main():
     src = Path(args.ruta)
     if not src.exists():
         sys.exit(f"No existe: {src}")
-    out = Path(args.salida) if args.salida else Path(__file__).parent / "resultados" / src.stem
+    out = Path(args.salida) if args.salida else Path(__file__).parent / "resultados" / src.stem.strip()  # Windows no admite carpetas que terminen en espacio
     out.mkdir(parents=True, exist_ok=True)
 
     device = verificar_gpu()
